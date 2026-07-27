@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
@@ -15,7 +15,15 @@ LOG_ROOT="${LOG_ROOT:-/var/log/vps-manager}"
 LOG_FILE="${LOG_ROOT}/vps-manager.log"
 LOCK_FILE="/run/lock/vps-manager.lock"
 DEFAULT_TIMEZONE="${DEFAULT_TIMEZONE:-Asia/Shanghai}"
-DEFAULT_PORTS="${DEFAULT_PORTS:-22/tcp,80/tcp,443/tcp}"
+DEFAULT_PORTS="${DEFAULT_PORTS:-22/tcp,80/tcp,443/tcp,443/udp,8443/tcp,8443/udp,2087/tcp}"
+SWAP_FILE="${VPS_MANAGER_SWAP_FILE:-/swapfile}"
+SWAP_SYSCTL_FILE="/etc/sysctl.d/99-vps-manager-swap.conf"
+FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/vps-manager-sshd.local"
+SSHD_MANAGED_FILE="/etc/ssh/sshd_config.d/00-vps-manager.conf"
+AUTO_UPGRADES_FILE="/etc/apt/apt.conf.d/20auto-upgrades"
+AUTO_UPGRADES_OPTIONS_FILE="/etc/apt/apt.conf.d/52vps-manager-unattended-upgrades"
+DOCKER_KEY_FILE="/etc/apt/keyrings/docker.asc"
+DOCKER_SOURCE_FILE="/etc/apt/sources.list.d/docker.sources"
 COMMON_PACKAGES=(
   ca-certificates
   curl
@@ -152,6 +160,33 @@ backup_file() {
   ok "已备份 ${file} -> ${backup}"
 }
 
+reboot_required() {
+  [[ -f /var/run/reboot-required ]]
+}
+
+show_reboot_status() {
+  if reboot_required; then
+    warn "系统标记为需要重启：$(tr '\n' ' ' < /var/run/reboot-required 2>/dev/null || printf 'reboot required')"
+    [[ -s /var/run/reboot-required.pkgs ]] && sed 's/^/  - /' /var/run/reboot-required.pkgs
+  else
+    printf '重启要求：当前未检测到系统要求重启\n'
+  fi
+}
+
+offer_reboot() {
+  local reason="$1"
+  warn "$reason"
+  warn "立即重启会中断当前 SSH 会话和正在运行的任务。"
+  confirm "是否立即重启 VPS？" || { info "已跳过重启，可稍后手动执行 sudo reboot。"; return 0; }
+  log_line "reboot requested: ${reason}"
+  sync
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reboot
+  else
+    reboot
+  fi
+}
+
 show_help() {
   cat <<EOF
 ${PROGRAM} ${VERSION}
@@ -162,6 +197,10 @@ ${PROGRAM} ${VERSION}
   ${PROGRAM} init         进入基础初始化向导
   ${PROGRAM} status       查看系统、SSH、防火墙、BBR、DNS、IP 状态
   ${PROGRAM} ports        进入防火墙与端口管理
+  ${PROGRAM} swap         进入 Swap 管理
+  ${PROGRAM} security     进入 Fail2ban 与自动安全更新
+  ${PROGRAM} docker       进入 Docker 管理
+  ${PROGRAM} hostname     设置主机名
   ${PROGRAM} check-ai     执行内置 AI 连通性检测
   ${PROGRAM} check-media  选择并运行第三方流媒体检测
   ${PROGRAM} update       从 GitHub 更新 vps-manager
@@ -205,9 +244,16 @@ system_upgrade() {
   require_root
   require_ubuntu || return 1
   acquire_lock || return 1
-  info "准备更新软件源并升级系统软件包。"
+  info "准备更新软件源并执行完整系统升级；该操作可能安装新内核。"
   log_command interactive apt-get update || return 1
-  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+  if ! log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y; then
+    return 1
+  fi
+  if reboot_required; then
+    offer_reboot "系统升级完成，并检测到新内核或关键组件要求重启。"
+  else
+    ok "系统升级完成，当前未检测到必须重启。"
+  fi
 }
 
 install_common_dependencies() {
@@ -217,6 +263,39 @@ install_common_dependencies() {
   info "准备安装常用依赖：${COMMON_PACKAGES[*]}"
   log_command interactive apt-get update || return 1
   log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y "${COMMON_PACKAGES[@]}"
+}
+
+show_hostname() {
+  printf '当前主机名：%s\n' "$(hostnamectl --static 2>/dev/null || hostname)"
+  hostnamectl status 2>/dev/null | sed -n '1,8p' || true
+}
+
+set_hostname() {
+  local new_hostname="${1:-}" hosts_file="/etc/hosts" old_hostname
+  require_root
+  require_ubuntu || return 1
+  old_hostname="$(hostnamectl --static 2>/dev/null || hostname)"
+  show_hostname
+  if [[ -z "$new_hostname" ]]; then
+    read -r -p "新的主机名（字母、数字和连字符，最长 63 位）：" new_hostname
+  fi
+  new_hostname="$(trim "${new_hostname,,}")"
+  if [[ ! "$new_hostname" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ && ! "$new_hostname" =~ ^[a-z0-9]$ ]]; then
+    error "主机名格式不正确。"
+    return 1
+  fi
+  [[ "$new_hostname" != "$old_hostname" ]] || { info "主机名已经是 ${new_hostname}。"; return 0; }
+  printf '准备修改：%s -> %s\n' "$old_hostname" "$new_hostname"
+  confirm "确认修改主机名？" || return 0
+  backup_file "$hosts_file"
+  hostnamectl set-hostname "$new_hostname" || return 1
+  if grep -qE '^127\.0\.1\.1[[:space:]]+' "$hosts_file"; then
+    sed -i -E "s/^127\.0\.1\.1[[:space:]]+.*/127.0.1.1 ${new_hostname}/" "$hosts_file"
+  else
+    printf '\n127.0.1.1 %s\n' "$new_hostname" >> "$hosts_file"
+  fi
+  ok "主机名已设置为 ${new_hostname}；新 SSH 会话会显示新名称。"
+  log_line "hostname changed from ${old_hostname} to ${new_hostname}"
 }
 
 set_timezone() {
@@ -259,7 +338,7 @@ collect_port_rules() {
       return 1
     fi
     PORT_RULES+=("$rule")
-  done < <(printf '%s' "$input" | tr ',' '\n')
+  done < <(printf '%s\n' "$input" | tr ',' '\n')
 }
 
 declare -a PORT_RULES=()
@@ -318,9 +397,12 @@ delete_port_rules() {
 }
 
 enable_ufw() {
+  local ssh_port
   ensure_ufw || return 1
-  warn "启用防火墙前，请确认当前 SSH 端口已经放行。"
-  confirm "确认启用 ufw？" || return 0
+  ssh_port="$(current_ssh_port)"
+  warn "脚本将在启用 UFW 前先放行当前 SSH TCP ${ssh_port}；云厂商安全组仍需自行确认。"
+  confirm "确认放行 SSH 并启用 ufw？" || return 0
+  log_command interactive ufw allow "${ssh_port}/tcp" comment "SSH before vps-manager" || return 1
   log_command interactive ufw --force enable
 }
 
@@ -389,10 +471,26 @@ EOF
   if log_command interactive sysctl --system; then
     ok "BBR 配置已写入 /etc/sysctl.d/99-vps-manager-bbr.conf"
     bbr_status
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+      info "BBR 已即时生效，通常不需要重启。"
+      offer_reboot "如需验证开机后 BBR 配置，可选择现在重启；通常可以跳过。"
+    elif reboot_required; then
+      offer_reboot "BBR 配置已写入，但系统同时标记为需要重启。"
+    fi
   else
     error "应用 sysctl 配置失败。"
     return 1
   fi
+}
+
+disable_bbr() {
+  require_root
+  [[ -f /etc/sysctl.d/99-vps-manager-bbr.conf ]] || { info "vps-manager 没有创建 BBR 配置。"; return 0; }
+  warn "只会删除 vps-manager 创建的 BBR sysctl 文件。"
+  confirm "确认移除 BBR 配置？" || return 0
+  rm -f /etc/sysctl.d/99-vps-manager-bbr.conf
+  log_command quiet sysctl --system || true
+  ok "已移除 vps-manager 的 BBR 配置，系统已重新加载现有 sysctl。"
 }
 
 bbr_menu() {
@@ -401,6 +499,7 @@ bbr_menu() {
     printf '\nBBR 与网络优化：\n'
     printf '  1. 查看 BBR 状态\n'
     printf '  2. 启用 BBR\n'
+    printf '  3. 移除 vps-manager 的 BBR 配置\n'
     printf '  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
@@ -412,6 +511,109 @@ bbr_menu() {
         fi
         pause
         ;;
+      3) disable_bbr; pause ;;
+      0) return 0 ;;
+      *) error "无效选项。"; pause ;;
+    esac
+  done
+}
+
+show_swap_status() {
+  printf '内存与 Swap：\n'
+  free -h 2>/dev/null || true
+  printf '\n活动 Swap：\n'
+  if command -v swapon >/dev/null 2>&1; then
+    swapon --show --output=NAME,TYPE,SIZE,USED,PRIO 2>/dev/null || true
+  fi
+  printf '\n持久化配置：\n'
+  grep -E '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab 2>/dev/null || printf '  未发现 fstab Swap 条目\n'
+  [[ -e "$SWAP_FILE" ]] && ls -lh "$SWAP_FILE"
+}
+
+create_swap() {
+  local size_gb available_kb required_kb target_dir
+  require_root
+  require_ubuntu || return 1
+  ensure_command mkswap util-linux || return 1
+  if swapon --noheadings --show=NAME 2>/dev/null | grep -Fxq "$SWAP_FILE"; then
+    info "${SWAP_FILE} 已作为 Swap 启用。"
+    show_swap_status
+    return 0
+  fi
+  if [[ -e "$SWAP_FILE" ]]; then
+    error "${SWAP_FILE} 已存在但未作为 Swap 启用，脚本不会覆盖。"
+    return 1
+  fi
+  read -r -p "Swap 大小 GiB [2]：" size_gb
+  size_gb="${size_gb:-2}"
+  if [[ ! "$size_gb" =~ ^[0-9]+$ ]] || (( size_gb < 1 || size_gb > 64 )); then
+    error "Swap 大小必须是 1 到 64 GiB 的整数。"
+    return 1
+  fi
+  target_dir="$(dirname "$SWAP_FILE")"
+  available_kb="$(df -Pk "$target_dir" | awk 'NR==2 {print $4}')"
+  required_kb=$((size_gb * 1024 * 1024 + 512 * 1024))
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < required_kb )); then
+    error "磁盘可用空间不足；创建 ${size_gb} GiB Swap 后至少需要保留 512 MiB。"
+    return 1
+  fi
+  printf '准备创建 %s GiB Swap：%s\n' "$size_gb" "$SWAP_FILE"
+  confirm "确认创建并设置开机启用？" || return 0
+  if ! fallocate -l "${size_gb}G" "$SWAP_FILE" 2>/dev/null; then
+    warn "fallocate 不可用，改用 dd 创建，可能需要一些时间。"
+    dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$((size_gb * 1024))" status=progress || { rm -f "$SWAP_FILE"; return 1; }
+  fi
+  chmod 0600 "$SWAP_FILE"
+  if ! mkswap "$SWAP_FILE" || ! swapon "$SWAP_FILE"; then
+    swapoff "$SWAP_FILE" 2>/dev/null || true
+    rm -f "$SWAP_FILE"
+    error "Swap 初始化失败，已清理候选文件。"
+    return 1
+  fi
+  if ! awk -v file="$SWAP_FILE" '$1==file && $3=="swap" {found=1} END {exit !found}' /etc/fstab; then
+    printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab
+  fi
+  printf 'vm.swappiness=10\n' > "$SWAP_SYSCTL_FILE"
+  chmod 0644 "$SWAP_SYSCTL_FILE"
+  sysctl -p "$SWAP_SYSCTL_FILE" >/dev/null 2>&1 || true
+  ok "Swap 已创建并启用。"
+  log_line "swap created: ${SWAP_FILE} ${size_gb}GiB"
+  show_swap_status
+}
+
+delete_swap() {
+  local temp_fstab
+  require_root
+  [[ -e "$SWAP_FILE" ]] || { info "未发现 vps-manager 默认 Swap 文件：${SWAP_FILE}"; return 0; }
+  warn "将停用并删除 ${SWAP_FILE}，释放其占用的磁盘空间。"
+  show_swap_status
+  confirm "确认删除该 Swap？" || return 0
+  if swapon --noheadings --show=NAME 2>/dev/null | grep -Fxq "$SWAP_FILE"; then
+    swapoff "$SWAP_FILE" || { error "无法停用 Swap，已停止删除。"; return 1; }
+  fi
+  temp_fstab="$(mktemp /tmp/vps-manager-fstab.XXXXXX)" || return 1
+  awk -v file="$SWAP_FILE" '$1 != file' /etc/fstab > "$temp_fstab"
+  install -m 0644 "$temp_fstab" /etc/fstab
+  rm -f "$temp_fstab" "$SWAP_FILE" "$SWAP_SYSCTL_FILE"
+  ok "${SWAP_FILE} 已删除。"
+  log_line "swap deleted: ${SWAP_FILE}"
+  show_swap_status
+}
+
+swap_menu() {
+  local choice
+  require_root
+  while true; do
+    printf '\nSwap 管理：\n'
+    printf '  1. 查看内存与 Swap\n'
+    printf '  2. 创建并启用 Swap\n'
+    printf '  3. 删除 vps-manager 管理的 Swap\n'
+    printf '  0. 返回\n'
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) show_swap_status; pause ;;
+      2) create_swap; pause ;;
+      3) delete_swap; pause ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -515,6 +717,16 @@ sshd_config_file() {
   printf '/etc/ssh/sshd_config'
 }
 
+current_ssh_port() {
+  local sshd
+  sshd="$(sshd_bin)"
+  if [[ -x "$sshd" ]]; then
+    "$sshd" -T 2>/dev/null | awk '$1=="port" {print $2; found=1; exit} END {if(!found) print 22}'
+  else
+    printf '22\n'
+  fi
+}
+
 show_ssh_status() {
   local sshd config
   sshd="$(sshd_bin)"
@@ -527,6 +739,8 @@ show_ssh_status() {
   fi
   printf '\n%s 中的相关配置：\n' "$config"
   grep -Ein '^[#[:space:]]*(Port|PermitRootLogin|PasswordAuthentication)[[:space:]]+' "$config" 2>/dev/null || true
+  printf '\nvps-manager 管理文件：%s\n' "$SSHD_MANAGED_FILE"
+  sed -n '1,80p' "$SSHD_MANAGED_FILE" 2>/dev/null || printf '  尚未创建\n'
 }
 
 set_sshd_option_in_file() {
@@ -548,7 +762,7 @@ reload_ssh_service() {
 }
 
 apply_sshd_option() {
-  local option="$1" value="$2" config backup sshd
+  local option="$1" value="$2" config backup="" sshd effective key had_file=0
   require_root
   require_ubuntu || return 1
   config="$(sshd_config_file)"
@@ -559,33 +773,84 @@ apply_sshd_option() {
   show_ssh_status
   printf '\n准备设置：%s %s\n' "$option" "$value"
   confirm "确认修改 SSH 配置？" || return 0
-  backup="${config}.bak.$(date '+%Y%m%d-%H%M%S')"
-  cp -a "$config" "$backup"
-  set_sshd_option_in_file "$config" "$option" "$value"
+  install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")"
+  if [[ -f "$SSHD_MANAGED_FILE" ]]; then
+    had_file=1
+    backup="${SSHD_MANAGED_FILE}.bak.$(date '+%Y%m%d-%H%M%S')"
+    cp -a "$SSHD_MANAGED_FILE" "$backup"
+  else
+    : > "$SSHD_MANAGED_FILE"
+  fi
+  set_sshd_option_in_file "$SSHD_MANAGED_FILE" "$option" "$value"
+  chmod 0644 "$SSHD_MANAGED_FILE"
 
   if "$sshd" -t -f "$config"; then
-    if reload_ssh_service; then
-      ok "SSH 配置已更新并重载。备份：${backup}"
-      return 0
+    key="${option,,}"
+    effective="$("$sshd" -T -f "$config" 2>/dev/null | awk -v key="$key" '$1==key {print $2; exit}')"
+    if [[ "${effective,,}" == "${value,,}" ]]; then
+      if reload_ssh_service; then
+        ok "SSH 配置已更新并重载：${SSHD_MANAGED_FILE}"
+        [[ -n "$backup" ]] && info "备份：${backup}"
+        return 0
+      fi
+      warn "配置校验通过，但 SSH 服务重载失败，正在恢复。"
+    else
+      error "最终生效值为 ${effective:-未知}，不是目标值 ${value}，正在恢复。"
     fi
-    warn "配置校验通过，但 SSH 服务重载失败。请手动检查服务名。备份：${backup}"
-    return 1
+  else
+    error "SSH 配置语法校验失败，正在恢复。"
   fi
 
-  cp -a "$backup" "$config"
-  error "SSH 配置校验失败，已恢复备份：${backup}"
+  if (( had_file )); then
+    cp -a "$backup" "$SSHD_MANAGED_FILE"
+  else
+    rm -f "$SSHD_MANAGED_FILE"
+  fi
+  reload_ssh_service || true
   return 1
 }
 
 change_ssh_port() {
-  local port
+  local port old_port
+  old_port="$(current_ssh_port)"
   read -r -p "新的 SSH 端口（1-65535）：" port
   if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( port < 1 || port > 65535 )); then
     error "端口不正确。"
     return 1
   fi
-  warn "修改 SSH 端口前，建议先在防火墙和 VPS 控制台安全组中放行 ${port}/tcp。"
-  apply_sshd_option Port "$port"
+  [[ "$port" != "$old_port" ]] || { info "SSH 当前已经使用端口 ${port}。"; return 0; }
+  warn "请先在 VPS 控制台安全组中放行 ${port}/tcp，并保留当前 SSH 会话用于回退。"
+  confirm "确认安全组已放行并继续？" || return 0
+  if ufw_is_active; then
+    info "检测到 UFW 已启用，先放行新的 SSH TCP ${port}。"
+    log_command interactive ufw allow "${port}/tcp" comment "SSH added by vps-manager" || return 1
+  fi
+  if apply_sshd_option Port "$port"; then
+    sync_fail2ban_ssh_port "$port" || true
+    ok "SSH 已改为 ${port}/tcp；旧端口 ${old_port}/tcp 未自动删除，请用新会话验证后再清理。"
+  fi
+}
+
+authorized_keys_present() {
+  local file
+  for file in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [[ -s "$file" ]] && return 0
+  done
+  return 1
+}
+
+disable_password_login() {
+  if ! authorized_keys_present; then
+    error "未发现任何非空 authorized_keys，拒绝关闭密码登录，以免锁定 SSH。"
+    return 1
+  fi
+  warn "关闭密码登录前，请保持当前会话，并另开窗口验证公钥登录。"
+  apply_sshd_option PasswordAuthentication no
+}
+
+disable_root_login() {
+  warn "关闭 root 登录前，请确认至少有一个可用的 sudo 用户和已验证的新 SSH 会话。"
+  apply_sshd_option PermitRootLogin no
 }
 
 ssh_menu() {
@@ -604,10 +869,158 @@ ssh_menu() {
     case "$choice" in
       1) show_ssh_status; pause ;;
       2) warn "开启 root 登录会增加暴力破解风险。"; apply_sshd_option PermitRootLogin yes; pause ;;
-      3) apply_sshd_option PermitRootLogin no; pause ;;
+      3) disable_root_login; pause ;;
       4) warn "开启密码登录会增加暴力破解风险。"; apply_sshd_option PasswordAuthentication yes; pause ;;
-      5) apply_sshd_option PasswordAuthentication no; pause ;;
+      5) disable_password_login; pause ;;
       6) change_ssh_port; pause ;;
+      0) return 0 ;;
+      *) error "无效选项。"; pause ;;
+    esac
+  done
+}
+
+show_fail2ban_status() {
+  if ! command -v fail2ban-client >/dev/null 2>&1; then
+    printf 'Fail2ban：未安装\n'
+    return 0
+  fi
+  systemctl --no-pager --full status fail2ban 2>/dev/null | sed -n '1,8p' || true
+  printf '\nSSH jail：\n'
+  fail2ban-client status sshd 2>/dev/null || printf '  sshd jail 未运行\n'
+  [[ -f "$FAIL2BAN_JAIL_FILE" ]] && { printf '\n管理配置：%s\n' "$FAIL2BAN_JAIL_FILE"; sed -n '1,80p' "$FAIL2BAN_JAIL_FILE"; }
+}
+
+sync_fail2ban_ssh_port() {
+  local port="$1"
+  [[ -f "$FAIL2BAN_JAIL_FILE" ]] || return 0
+  sed -i -E "s/^port[[:space:]]*=.*/port = ${port}/" "$FAIL2BAN_JAIL_FILE"
+  if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client -t >/dev/null 2>&1; then
+    systemctl restart fail2ban >/dev/null 2>&1 || true
+    ok "Fail2ban SSH jail 已同步到端口 ${port}。"
+  else
+    warn "Fail2ban 端口已写入，但配置测试或重启失败，请检查 ${FAIL2BAN_JAIL_FILE}。"
+    return 1
+  fi
+}
+
+enable_fail2ban() {
+  local port backup=""
+  require_root
+  require_ubuntu || return 1
+  port="$(current_ssh_port)"
+  info "将安装 Fail2ban，并保护当前 SSH TCP ${port}。"
+  confirm "确认安装并启用 SSH 防暴力破解？" || return 0
+  log_command interactive apt-get update || return 1
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || return 1
+  install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")"
+  if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
+    backup="${FAIL2BAN_JAIL_FILE}.bak.$(date '+%Y%m%d-%H%M%S')"
+    cp -a "$FAIL2BAN_JAIL_FILE" "$backup"
+  fi
+  {
+    printf '[sshd]\n'
+    printf 'enabled = true\n'
+    printf 'port = %s\n' "$port"
+    printf 'backend = systemd\n'
+    printf 'maxretry = 5\n'
+    printf 'findtime = 10m\n'
+    printf 'bantime = 1h\n'
+  } > "$FAIL2BAN_JAIL_FILE"
+  chmod 0644 "$FAIL2BAN_JAIL_FILE"
+  if ! fail2ban-client -t; then
+    if [[ -n "$backup" ]]; then cp -a "$backup" "$FAIL2BAN_JAIL_FILE"; else rm -f "$FAIL2BAN_JAIL_FILE"; fi
+    error "Fail2ban 配置测试失败，已恢复。"
+    return 1
+  fi
+  systemctl enable --now fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban || { error "Fail2ban 启动失败。"; return 1; }
+  ok "Fail2ban SSH 防护已启用：5 次失败/10 分钟，封禁 1 小时。"
+  log_line "fail2ban sshd enabled on port ${port}"
+  show_fail2ban_status
+}
+
+disable_fail2ban() {
+  require_root
+  [[ -f "$FAIL2BAN_JAIL_FILE" ]] || { info "未发现 vps-manager 管理的 Fail2ban SSH jail。"; return 0; }
+  warn "只会移除 vps-manager 的 SSH jail，不卸载 Fail2ban，也不删除其他 jail。"
+  confirm "确认关闭该 SSH jail？" || return 0
+  rm -f "$FAIL2BAN_JAIL_FILE"
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    systemctl restart fail2ban >/dev/null 2>&1 || true
+  fi
+  ok "vps-manager 的 Fail2ban SSH jail 已移除。"
+}
+
+show_auto_updates_status() {
+  if dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'install ok installed'; then
+    printf 'unattended-upgrades：已安装\n'
+  else
+    printf 'unattended-upgrades：未安装\n'
+  fi
+  printf '\n自动更新周期配置：\n'
+  sed -n '1,80p' "$AUTO_UPGRADES_FILE" 2>/dev/null || printf '  未配置\n'
+  printf '\n脚本管理选项：\n'
+  sed -n '1,80p' "$AUTO_UPGRADES_OPTIONS_FILE" 2>/dev/null || printf '  未配置\n'
+  printf '\nAPT 定时器：\n'
+  systemctl list-timers apt-daily.timer apt-daily-upgrade.timer --no-pager 2>/dev/null || true
+}
+
+enable_auto_updates() {
+  require_root
+  require_ubuntu || return 1
+  info "只启用 Ubuntu unattended-upgrades 的安全更新；不会自动重启。"
+  confirm "确认安装并启用自动安全更新？" || return 0
+  log_command interactive apt-get update || return 1
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades || return 1
+  backup_file "$AUTO_UPGRADES_FILE"
+  {
+    printf 'APT::Periodic::Update-Package-Lists "1";\n'
+    printf 'APT::Periodic::Unattended-Upgrade "1";\n'
+  } > "$AUTO_UPGRADES_FILE"
+  {
+    printf 'Unattended-Upgrade::Automatic-Reboot "false";\n'
+    printf 'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";\n'
+    printf 'Unattended-Upgrade::Remove-New-Unused-Dependencies "true";\n'
+  } > "$AUTO_UPGRADES_OPTIONS_FILE"
+  chmod 0644 "$AUTO_UPGRADES_FILE" "$AUTO_UPGRADES_OPTIONS_FILE"
+  systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+  ok "自动安全更新已启用，自动重启保持关闭。"
+  log_line "unattended-upgrades enabled without automatic reboot"
+  show_auto_updates_status
+}
+
+disable_auto_updates() {
+  require_root
+  warn "不会卸载 unattended-upgrades，只会关闭周期执行并删除脚本管理的附加选项。"
+  confirm "确认关闭自动安全更新？" || return 0
+  {
+    printf 'APT::Periodic::Update-Package-Lists "0";\n'
+    printf 'APT::Periodic::Unattended-Upgrade "0";\n'
+  } > "$AUTO_UPGRADES_FILE"
+  rm -f "$AUTO_UPGRADES_OPTIONS_FILE"
+  ok "自动安全更新周期已关闭。"
+}
+
+security_menu() {
+  local choice
+  require_root
+  while true; do
+    printf '\n安全防护：\n'
+    printf '  1. 查看 Fail2ban 状态\n'
+    printf '  2. 安装/更新并启用 Fail2ban SSH jail\n'
+    printf '  3. 关闭 vps-manager 的 Fail2ban SSH jail\n'
+    printf '  4. 查看自动安全更新状态\n'
+    printf '  5. 安装并启用自动安全更新\n'
+    printf '  6. 关闭自动安全更新\n'
+    printf '  0. 返回\n'
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) show_fail2ban_status; pause ;;
+      2) enable_fail2ban; pause ;;
+      3) disable_fail2ban; pause ;;
+      4) show_auto_updates_status; pause ;;
+      5) enable_auto_updates; pause ;;
+      6) disable_auto_updates; pause ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -704,8 +1117,140 @@ check_media_menu() {
   done
 }
 
+show_docker_status() {
+  local active="未运行" enabled="未启用"
+  if command -v docker >/dev/null 2>&1; then
+    docker --version 2>/dev/null || true
+    docker compose version 2>/dev/null || true
+    docker buildx version 2>/dev/null || true
+  else
+    printf 'Docker：未安装\n'
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    active="$(systemctl is-active docker 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled docker 2>/dev/null || true)"
+    printf 'Docker 服务：%s\n' "${active:-未运行}"
+    printf '开机启动：%s\n' "${enabled:-未启用}"
+  fi
+  [[ -f "$DOCKER_SOURCE_FILE" ]] && { printf '\nDocker 官方源：\n'; sed -n '1,80p' "$DOCKER_SOURCE_FILE"; }
+}
+
+install_docker_official() {
+  local codename architecture package
+  local -a conflicts=() conflict_packages=(docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)
+  require_root
+  require_ubuntu || return 1
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+  architecture="$(dpkg --print-architecture)"
+  [[ -n "$codename" && -n "$architecture" ]] || { error "无法识别 Ubuntu 代号或架构。"; return 1; }
+  case "$architecture" in
+    amd64|armhf|arm64|s390x|ppc64el) ;;
+    *) error "Docker 官方 Ubuntu 仓库不支持当前架构：${architecture}"; return 1 ;;
+  esac
+  case "$codename" in
+    jammy|noble|questing|resolute) ;;
+    *)
+      warn "当前 Ubuntu 代号 ${codename} 不在脚本已知的 Docker 官方支持列表。"
+      confirm "仍要尝试使用 Docker 官方仓库？" || return 0
+      ;;
+  esac
+  for package in "${conflict_packages[@]}"; do
+    if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed'; then
+      conflicts+=("$package")
+    fi
+  done
+  if (( ${#conflicts[@]} > 0 )); then
+    warn "检测到与 Docker CE 官方包冲突的软件包：${conflicts[*]}"
+    warn "移除软件包不会自动删除 /var/lib/docker，但仍可能影响现有容器服务。"
+    confirm "确认移除这些冲突包？" || return 0
+    log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get remove -y "${conflicts[@]}" || return 1
+  fi
+  info "准备配置 Docker 官方 Ubuntu 仓库：${codename}/${architecture}。"
+  confirm "确认安装或更新 Docker Engine？" || return 0
+  log_command interactive apt-get update || return 1
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl || return 1
+  install -d -m 0755 /etc/apt/keyrings
+  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$DOCKER_KEY_FILE"; then
+    error "Docker 官方 GPG key 下载失败。"
+    return 1
+  fi
+  chmod a+r "$DOCKER_KEY_FILE"
+  {
+    printf 'Types: deb\n'
+    printf 'URIs: https://download.docker.com/linux/ubuntu\n'
+    printf 'Suites: %s\n' "$codename"
+    printf 'Components: stable\n'
+    printf 'Architectures: %s\n' "$architecture"
+    printf 'Signed-By: %s\n' "$DOCKER_KEY_FILE"
+  } > "$DOCKER_SOURCE_FILE"
+  chmod 0644 "$DOCKER_SOURCE_FILE"
+  log_command interactive apt-get update || return 1
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
+  systemctl enable --now docker || { error "Docker 服务启动失败。"; return 1; }
+  ok "Docker Engine、Buildx 和 Compose 插件已安装。"
+  log_line "docker official engine installed for ${codename}/${architecture}"
+  show_docker_status
+}
+
+add_user_to_docker_group() {
+  local username="${1:-}"
+  require_root
+  command -v docker >/dev/null 2>&1 || { error "请先安装 Docker。"; return 1; }
+  if [[ -z "$username" ]]; then
+    read -r -p "要加入 docker 组的现有用户名：" username
+  fi
+  id "$username" >/dev/null 2>&1 || { error "用户不存在：${username}"; return 1; }
+  warn "docker 组成员可以控制 Docker daemon，权限实际等同 root。"
+  confirm "确认将 ${username} 加入 docker 组？" || return 0
+  groupadd -f docker
+  usermod -aG docker "$username"
+  ok "${username} 已加入 docker 组；需要重新登录后生效。"
+}
+
+test_docker() {
+  require_root
+  command -v docker >/dev/null 2>&1 || { error "Docker 尚未安装。"; return 1; }
+  warn "测试会从 Docker Hub 拉取 hello-world 镜像并运行一次。"
+  confirm "确认运行 Docker 测试？" || return 0
+  log_command interactive docker run --rm hello-world
+}
+
+docker_menu() {
+  local choice
+  require_root
+  while true; do
+    printf '\nDocker 管理：\n'
+    printf '  1. 查看 Docker 状态\n'
+    printf '  2. 按官方 Ubuntu 流程安装/更新 Docker\n'
+    printf '  3. 将现有用户加入 docker 组\n'
+    printf '  4. 运行 hello-world 测试\n'
+    printf '  0. 返回\n'
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) show_docker_status; pause ;;
+      2) install_docker_official; pause ;;
+      3) add_user_to_docker_group; pause ;;
+      4) test_docker; pause ;;
+      0) return 0 ;;
+      *) error "无效选项。"; pause ;;
+    esac
+  done
+}
+
 show_status() {
   print_os_summary
+  printf '\n主机名：\n'
+  show_hostname
+  printf '\n内存与 Swap：\n'
+  free -h 2>/dev/null || true
+  swapon --show 2>/dev/null || true
+  printf '\n根分区：\n'
+  df -h / 2>/dev/null || true
+  printf '\n重启状态：\n'
+  show_reboot_status
   printf '\n公网 IP：\n'
   show_public_ip
   printf '\nSSH：\n'
@@ -714,6 +1259,10 @@ show_status() {
   show_firewall_status
   printf '\nBBR：\n'
   bbr_status
+  printf '\nFail2ban：\n'
+  show_fail2ban_status
+  printf '\nDocker：\n'
+  show_docker_status
   printf '\nDNS：\n'
   show_dns_status
 }
@@ -726,12 +1275,46 @@ show_log() {
   fi
 }
 
+system_menu() {
+  local choice timezone
+  require_root
+  require_ubuntu || return 1
+  while true; do
+    printf '\n系统与主机设置：\n'
+    printf '  1. 完整系统升级\n'
+    printf '  2. 查看/设置主机名\n'
+    printf '  3. 设置时区\n'
+    printf '  4. 安装常用依赖\n'
+    printf '  5. 查看是否需要重启\n'
+    printf '  6. 立即重启\n'
+    printf '  0. 返回\n'
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) system_upgrade; pause ;;
+      2) set_hostname; pause ;;
+      3)
+        read -r -p "时区 [${DEFAULT_TIMEZONE}]：" timezone
+        set_timezone "${timezone:-$DEFAULT_TIMEZONE}"
+        pause
+        ;;
+      4) install_common_dependencies; pause ;;
+      5) show_reboot_status; pause ;;
+      6) offer_reboot "用户从系统菜单请求立即重启。" ;;
+      0) return 0 ;;
+      *) error "无效选项。"; pause ;;
+    esac
+  done
+}
+
 init_wizard() {
   require_root
   require_ubuntu || return 1
   banner
   info "基础初始化会逐项确认，不会静默修改系统关键配置。"
-  if confirm "是否更新软件源并升级系统？"; then
+  if confirm "是否设置统一主机名？"; then
+    set_hostname || warn "主机名设置未完成。"
+  fi
+  if confirm "是否更新软件源并执行完整系统升级？"; then
     system_upgrade || warn "系统升级步骤失败。"
   fi
   if confirm "是否设置时区为 ${DEFAULT_TIMEZONE}？"; then
@@ -740,8 +1323,20 @@ init_wizard() {
   if confirm "是否安装常用依赖？"; then
     install_common_dependencies || warn "依赖安装步骤失败。"
   fi
+  if confirm "是否配置小内存 VPS 的 Swap？"; then
+    create_swap || warn "Swap 步骤未完成。"
+  fi
   if confirm "是否检查并启用 BBR？"; then
     enable_bbr || warn "BBR 步骤未完成。"
+  fi
+  if confirm "是否安装并启用 Fail2ban SSH 防护？"; then
+    enable_fail2ban || warn "Fail2ban 步骤未完成。"
+  fi
+  if confirm "是否启用自动安全更新（不自动重启）？"; then
+    enable_auto_updates || warn "自动安全更新步骤未完成。"
+  fi
+  if confirm "是否安装 Docker 官方版本？"; then
+    install_docker_official || warn "Docker 步骤未完成。"
   fi
   if confirm "是否进入防火墙与端口向导？"; then
     open_port_rules "$DEFAULT_PORTS" || warn "默认端口放行未完成。"
@@ -756,12 +1351,14 @@ init_wizard() {
 install_alias() {
   [[ -n "$ALIAS_PATH" ]] || return 0
   [[ "$ALIAS_PATH" == "$INSTALL_PATH" ]] && return 0
-  install -d -m 0755 "$(dirname "$ALIAS_PATH")"
-  if [[ -e "$ALIAS_PATH" && ! -L "$ALIAS_PATH" ]]; then
-    warn "${ALIAS_PATH} 已存在且不是软链接，跳过快捷命令配置。"
+  install -d -m 0755 "$(dirname "$ALIAS_PATH")" || return 1
+  if [[ -e "$ALIAS_PATH" || -L "$ALIAS_PATH" ]]; then
+    if [[ "$(readlink -f "$ALIAS_PATH" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
+      warn "${ALIAS_PATH} 已被其他文件占用，跳过快捷命令配置。"
+    fi
     return 0
   fi
-  if ln -sfn "$INSTALL_PATH" "$ALIAS_PATH"; then
+  if ln -s "$INSTALL_PATH" "$ALIAS_PATH"; then
     ok "快捷命令已配置：sudo $(basename "$ALIAS_PATH")"
   else
     warn "快捷命令配置失败：${ALIAS_PATH}"
@@ -770,11 +1367,11 @@ install_alias() {
 
 install_manager_binary() {
   require_root
-  install -d -m 0755 "$(dirname "$INSTALL_PATH")"
+  install -d -m 0755 "$(dirname "$INSTALL_PATH")" || return 1
   if [[ "$SELF_PATH" == "$INSTALL_PATH" ]]; then
-    chmod 0755 "$INSTALL_PATH"
+    chmod 0755 "$INSTALL_PATH" || return 1
   elif [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
-    install -m 0755 "$SELF_PATH" "$INSTALL_PATH"
+    install -m 0755 "$SELF_PATH" "$INSTALL_PATH" || return 1
   else
     error "当前脚本来自临时数据流，无法安装固定副本。请使用 install.sh 引导安装器。"
     return 1
@@ -784,7 +1381,7 @@ install_manager_binary() {
 }
 
 update_manager() {
-  local timestamp installer installer_url source_url rc
+  local timestamp installer installer_url source_url rc backup="" new_version=""
   require_root
   ensure_command curl curl || return 1
 
@@ -792,15 +1389,19 @@ update_manager() {
   installer_url="${MANAGER_RAW_BASE}/install.sh?ts=${timestamp}"
   source_url="${MANAGER_RAW_BASE}/vps-manager.sh?ts=${timestamp}"
   installer="$(mktemp /tmp/vps-manager-bootstrap.XXXXXX.sh)" || return 1
+  if [[ -f "$INSTALL_PATH" ]]; then
+    backup="$(mktemp /tmp/vps-manager-current.XXXXXX.sh)" || { rm -f "$installer"; return 1; }
+    cp -a "$INSTALL_PATH" "$backup"
+  fi
 
   info "正在检查 ${MANAGER_REPO}@${MANAGER_REF} 的管理器版本..."
   if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$installer_url" -o "$installer"; then
-    rm -f "$installer"
+    rm -f "$installer" "$backup"
     error "无法下载 GitHub 引导安装器。"
     return 1
   fi
   if ! bash -n "$installer" || ! grep -q '^# Bootstrap installer for vps-manager\.$' "$installer"; then
-    rm -f "$installer"
+    rm -f "$installer" "$backup"
     error "下载内容未通过安装器校验，拒绝更新。"
     return 1
   fi
@@ -809,15 +1410,26 @@ update_manager() {
     VPS_MANAGER_REF="$MANAGER_REF" \
     VPS_MANAGER_SOURCE_URL="$source_url" \
     VPS_MANAGER_INSTALL_PATH="$INSTALL_PATH" \
+    VPS_MANAGER_ALIAS_PATH="$ALIAS_PATH" \
     bash "$installer" version
   rc=$?
   rm -f "$installer"
 
   if (( rc != 0 )); then
+    [[ -n "$backup" && -s "$backup" ]] && install -m 0755 "$backup" "$INSTALL_PATH"
+    rm -f "$backup"
     error "vps-manager 更新失败。"
     return "$rc"
   fi
-  ok "vps-manager 更新完成。"
+  new_version="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}')"
+  if [[ -z "$new_version" || "$(printf '%s\n' "$VERSION" "$new_version" | sort -V | head -n 1)" != "$VERSION" ]]; then
+    [[ -n "$backup" && -s "$backup" ]] && install -m 0755 "$backup" "$INSTALL_PATH"
+    rm -f "$backup"
+    error "远程版本 ${new_version:-未知} 低于或无法验证当前版本 ${VERSION}，已拒绝降级并恢复。"
+    return 1
+  fi
+  rm -f "$backup"
+  ok "vps-manager 更新完成：${VERSION} -> ${new_version}"
 }
 
 advanced_menu() {
@@ -858,26 +1470,34 @@ main_menu() {
       print_os_summary
     fi
     printf '\n'
-    printf '  1. 基础初始化\n'
-    printf '  2. SSH/root 登录设置\n'
-    printf '  3. 防火墙与端口\n'
-    printf '  4. BBR 与网络优化\n'
-    printf '  5. DNS 配置\n'
-    printf '  6. AI/流媒体解锁检测\n'
-    printf '  7. 系统状态与最近日志\n'
-    printf '  8. 高级维护\n'
+    printf '  1. 基础初始化向导\n'
+    printf '  2. 系统升级、主机名、时区与重启\n'
+    printf '  3. SSH/root 登录设置\n'
+    printf '  4. Fail2ban 与自动安全更新\n'
+    printf '  5. 防火墙与端口\n'
+    printf '  6. BBR 与网络优化\n'
+    printf '  7. Swap 管理\n'
+    printf '  8. Docker 管理\n'
+    printf '  9. DNS 配置\n'
+    printf ' 10. AI/流媒体解锁检测\n'
+    printf ' 11. 系统状态与最近日志\n'
+    printf ' 12. 高级维护\n'
     printf '  0. 退出\n'
     read -r -p "请选择：" choice
     printf '\n'
     case "$choice" in
       1) init_wizard; pause ;;
-      2) ssh_menu ;;
-      3) firewall_menu ;;
-      4) bbr_menu ;;
-      5) dns_menu ;;
-      6) check_media_menu ;;
-      7) show_status; printf '\n最近日志：\n'; show_log; pause ;;
-      8) advanced_menu ;;
+      2) system_menu ;;
+      3) ssh_menu ;;
+      4) security_menu ;;
+      5) firewall_menu ;;
+      6) bbr_menu ;;
+      7) swap_menu ;;
+      8) docker_menu ;;
+      9) dns_menu ;;
+      10) check_media_menu ;;
+      11) show_status; printf '\n最近日志：\n'; show_log; pause ;;
+      12) advanced_menu ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -890,7 +1510,12 @@ main() {
     menu) main_menu ;;
     init) init_wizard ;;
     status) show_status ;;
+    system) system_menu ;;
     ports) firewall_menu ;;
+    swap) swap_menu ;;
+    security) security_menu ;;
+    docker) docker_menu ;;
+    hostname) shift; set_hostname "${1:-}" ;;
     check-ai) check_ai_connectivity ;;
     check-media) check_media_menu ;;
     update|update-manager) update_manager ;;
@@ -901,4 +1526,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${VPS_MANAGER_NO_MAIN:-0}" != "1" ]]; then
+  main "$@"
+fi
