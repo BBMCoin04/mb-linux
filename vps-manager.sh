@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.2.3"
+VERSION="1.2.4"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
@@ -13,6 +13,7 @@ MANAGER_REF="${VPS_MANAGER_REF:-main}"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/${MANAGER_REF}"
 LOG_ROOT="${LOG_ROOT:-/var/log/vps-manager}"
 LOG_FILE="${LOG_ROOT}/vps-manager.log"
+BACKUP_ROOT="${VPS_MANAGER_BACKUP_ROOT:-/var/backups/vps-manager}"
 LOCK_FILE="/run/lock/vps-manager.lock"
 DEFAULT_TIMEZONE="${DEFAULT_TIMEZONE:-Asia/Shanghai}"
 DEFAULT_PORTS="${DEFAULT_PORTS:-22/tcp,80/tcp,443/tcp,443/udp,8443/tcp,8443/udp,2087/tcp}"
@@ -20,8 +21,9 @@ SWAP_FILE="${VPS_MANAGER_SWAP_FILE:-/swapfile}"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-vps-manager-swap.conf"
 FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/vps-manager-sshd.local"
 SSHD_MANAGED_FILE="/etc/ssh/sshd_config.d/00-vps-manager.conf"
-AUTO_UPGRADES_FILE="/etc/apt/apt.conf.d/20auto-upgrades"
-AUTO_UPGRADES_OPTIONS_FILE="/etc/apt/apt.conf.d/52vps-manager-unattended-upgrades"
+APT_CONFIG_DIR="${VPS_MANAGER_APT_CONFIG_DIR:-/etc/apt/apt.conf.d}"
+AUTO_UPGRADES_FILE="${VPS_MANAGER_AUTO_UPGRADES_FILE:-${APT_CONFIG_DIR}/20auto-upgrades}"
+AUTO_UPGRADES_OPTIONS_FILE="${VPS_MANAGER_AUTO_UPGRADES_OPTIONS_FILE:-${APT_CONFIG_DIR}/52vps-manager-unattended-upgrades}"
 DOCKER_KEY_FILE="/etc/apt/keyrings/docker.asc"
 DOCKER_SOURCE_FILE="/etc/apt/sources.list.d/docker.sources"
 COMMON_PACKAGES=(
@@ -168,14 +170,37 @@ ensure_command() {
 }
 
 backup_file() {
-  local file="$1" backup
+  local file="$1" backup backup_name
   [[ -e "$file" || -L "$file" ]] || return 0
-  backup="${file}.bak.$(date '+%Y%m%d-%H%M%S').$$"
+  install -d -m 0700 "$BACKUP_ROOT" || return 1
+  backup_name="${file#/}"
+  backup_name="${backup_name//\//_}"
+  backup="${BACKUP_ROOT}/${backup_name}.bak.$(date '+%Y%m%d-%H%M%S').$$"
   if ! cp -a -- "$file" "$backup"; then
     error "无法备份 ${file}。"
     return 1
   fi
   ok "已备份 ${file} -> ${backup}"
+}
+
+relocate_legacy_apt_backups() {
+  local file destination moved=0
+  local -a files=()
+  shopt -s nullglob
+  files=(
+    "$APT_CONFIG_DIR"/20auto-upgrades.bak.*
+    "$APT_CONFIG_DIR"/52vps-manager-unattended-upgrades.bak.*
+  )
+  shopt -u nullglob
+  (( ${#files[@]} > 0 )) || return 0
+  install -d -m 0700 "$BACKUP_ROOT" || return 1
+  for file in "${files[@]}"; do
+    destination="${BACKUP_ROOT}/legacy-$(basename "$file")"
+    [[ ! -e "$destination" && ! -L "$destination" ]] || destination="${destination}.$(date '+%Y%m%d-%H%M%S').$$"
+    mv -- "$file" "$destination" || return 1
+    moved=$((moved + 1))
+  done
+  ok "已将 ${moved} 个旧版 APT 配置备份移到 ${BACKUP_ROOT}。"
 }
 
 reboot_required() {
@@ -471,7 +496,7 @@ set_firewall_tight() {
   acquire_lock || return 1
 
   ufw_is_active && was_active=1
-  backup_dir="/var/backups/vps-manager-ufw-$(date '+%Y%m%d-%H%M%S').$$"
+  backup_dir="${BACKUP_ROOT}/ufw-$(date '+%Y%m%d-%H%M%S').$$"
   install -d -m 0700 "$backup_dir" || return 1
   cp -a -- /etc/ufw "$backup_dir/ufw" || { error "无法备份 UFW 配置。"; return 1; }
   [[ ! -f /etc/default/ufw ]] || cp -a -- /etc/default/ufw "$backup_dir/default-ufw" || return 1
@@ -950,7 +975,8 @@ apply_sshd_option() {
   install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")"
   if [[ -f "$SSHD_MANAGED_FILE" ]]; then
     had_file=1
-    backup="${SSHD_MANAGED_FILE}.bak.$(date '+%Y%m%d-%H%M%S').$$"
+    install -d -m 0700 "$BACKUP_ROOT" || return 1
+    backup="${BACKUP_ROOT}/etc_ssh_sshd_config.d_00-vps-manager.conf.bak.$(date '+%Y%m%d-%H%M%S').$$"
     cp -a -- "$SSHD_MANAGED_FILE" "$backup" || { error "无法备份 SSH 管理配置。"; return 1; }
   elif ! : > "$SSHD_MANAGED_FILE"; then
     error "无法创建 SSH 管理配置。"
@@ -1122,7 +1148,8 @@ enable_fail2ban() {
   log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || return 1
   install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")"
   if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
-    backup="${FAIL2BAN_JAIL_FILE}.bak.$(date '+%Y%m%d-%H%M%S').$$"
+    install -d -m 0700 "$BACKUP_ROOT" || return 1
+    backup="${BACKUP_ROOT}/etc_fail2ban_jail.d_vps-manager-sshd.local.bak.$(date '+%Y%m%d-%H%M%S').$$"
     cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { error "无法备份现有 Fail2ban 配置。"; return 1; }
   fi
   {
@@ -1196,6 +1223,7 @@ enable_auto_updates() {
   require_ubuntu || return 1
   info "只启用 Ubuntu unattended-upgrades 的安全更新；不会自动重启。"
   confirm "确认安装并启用自动安全更新？" || return 0
+  relocate_legacy_apt_backups || { error "迁移旧版 APT 备份失败，已停止配置。"; return 1; }
   log_command interactive apt-get update || return 1
   log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades || return 1
   backup_file "$AUTO_UPGRADES_FILE" || return 1
@@ -1507,6 +1535,7 @@ safe_system_cleanup() {
   printf '明确不会执行：autoremove、Docker prune、证书/密钥删除、用户目录扫描、防火墙清空。\n'
   confirm "确认执行以上保守清理？" || return 0
   acquire_lock || return 1
+  relocate_legacy_apt_backups || { error "迁移旧版 APT 备份失败，已停止清理。"; return 1; }
 
   before_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $3}' || printf '0')"
   if command -v apt-get >/dev/null 2>&1; then
