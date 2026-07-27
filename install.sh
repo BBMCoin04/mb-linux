@@ -9,6 +9,7 @@ DEFAULT_REPO="BBMCoin04/mb-linux"
 REPO="${VPS_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${VPS_MANAGER_REF:-main}"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
+ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
 SOURCE_URL="${VPS_MANAGER_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/vps-manager.sh}"
 TEMP_FILE=""
 
@@ -82,6 +83,14 @@ fi
 
 install -d -m 0755 "$(dirname "$INSTALL_PATH")"
 install -m 0755 "$TEMP_FILE" "$INSTALL_PATH"
+if [[ -n "$ALIAS_PATH" && "$ALIAS_PATH" != "$INSTALL_PATH" ]]; then
+  install -d -m 0755 "$(dirname "$ALIAS_PATH")"
+  if [[ -e "$ALIAS_PATH" && ! -L "$ALIAS_PATH" ]]; then
+    info "${ALIAS_PATH} 已存在且不是软链接，跳过快捷命令配置。"
+  elif ln -sfn "$INSTALL_PATH" "$ALIAS_PATH"; then
+    ok "快捷命令已配置：sudo $(basename "$ALIAS_PATH")"
+  fi
+fi
 hash_value="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || true)"
 ok "vps-manager 已安装到 ${INSTALL_PATH}"
 [[ -n "$hash_value" ]] && printf 'SHA-256: %s\n' "$hash_value"
@@ -98,4 +107,4 @@ if [[ -r /dev/tty && -w /dev/tty ]]; then
   exec "$INSTALL_PATH" </dev/tty >/dev/tty
 fi
 
-info "当前环境没有交互终端。稍后运行：sudo ${INSTALL_PATH}"
+info "当前环境没有交互终端。稍后运行：sudo ${INSTALL_PATH} 或 sudo ${ALIAS_PATH}"

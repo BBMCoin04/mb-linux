@@ -30,13 +30,16 @@ wget -qO- https://raw.githubusercontent.com/BBMCoin04/mb-linux/main/install.sh |
 2. 将主程序下载到临时文件。
 3. 检查文件非空、程序标识和 Bash 语法。
 4. 安装为 `/usr/local/sbin/vps-manager`。
-5. 输出安装文件的 SHA-256（系统支持时）。
-6. 重新连接当前终端并打开交互菜单。
+5. 创建快捷命令 `/usr/local/sbin/lm`。
+6. 输出安装文件的 SHA-256（系统支持时）。
+7. 重新连接当前终端并打开交互菜单。
 
 重新打开菜单：
 
 ```bash
 sudo vps-manager
+# 或
+sudo lm
 ```
 
 ## 主菜单
@@ -156,6 +159,7 @@ DNS 菜单优先使用 `systemd-resolved`，否则回退到 `/etc/resolv.conf`�
 
 ```bash
 sudo vps-manager
+sudo lm
 sudo vps-manager init
 sudo vps-manager status
 sudo vps-manager ports
@@ -163,6 +167,7 @@ sudo vps-manager check-ai
 sudo vps-manager check-media
 sudo vps-manager update
 sudo vps-manager install
+lm version
 vps-manager version
 vps-manager help
 ```

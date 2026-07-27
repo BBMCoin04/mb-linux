@@ -7,6 +7,7 @@ umask 077
 VERSION="1.0.0"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
+ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
 MANAGER_REPO="${VPS_MANAGER_REPO:-BBMCoin04/mb-linux}"
 MANAGER_REF="${VPS_MANAGER_REF:-main}"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/${MANAGER_REF}"
@@ -157,6 +158,7 @@ ${PROGRAM} ${VERSION}
 
 用法：
   ${PROGRAM}              打开交互菜单
+  lm                       快捷打开交互菜单
   ${PROGRAM} init         进入基础初始化向导
   ${PROGRAM} status       查看系统、SSH、防火墙、BBR、DNS、IP 状态
   ${PROGRAM} ports        进入防火墙与端口管理
@@ -751,6 +753,21 @@ init_wizard() {
   ok "基础初始化向导已结束。"
 }
 
+install_alias() {
+  [[ -n "$ALIAS_PATH" ]] || return 0
+  [[ "$ALIAS_PATH" == "$INSTALL_PATH" ]] && return 0
+  install -d -m 0755 "$(dirname "$ALIAS_PATH")"
+  if [[ -e "$ALIAS_PATH" && ! -L "$ALIAS_PATH" ]]; then
+    warn "${ALIAS_PATH} 已存在且不是软链接，跳过快捷命令配置。"
+    return 0
+  fi
+  if ln -sfn "$INSTALL_PATH" "$ALIAS_PATH"; then
+    ok "快捷命令已配置：sudo $(basename "$ALIAS_PATH")"
+  else
+    warn "快捷命令配置失败：${ALIAS_PATH}"
+  fi
+}
+
 install_manager_binary() {
   require_root
   install -d -m 0755 "$(dirname "$INSTALL_PATH")"
@@ -762,6 +779,7 @@ install_manager_binary() {
     error "当前脚本来自临时数据流，无法安装固定副本。请使用 install.sh 引导安装器。"
     return 1
   fi
+  install_alias
   ok "vps-manager 已安装到 ${INSTALL_PATH}"
 }
 
