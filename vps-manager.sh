@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
@@ -140,12 +140,12 @@ log_command() {
   return "${PIPESTATUS[0]}"
 }
 
-is_ubuntu() {
+is_ubuntu() (
   [[ -r /etc/os-release ]] || return 1
   # shellcheck disable=SC1091
   . /etc/os-release
   [[ "${ID:-}" == "ubuntu" ]]
-}
+)
 
 require_ubuntu() {
   if ! is_ubuntu; then
@@ -214,13 +214,13 @@ ${PROGRAM} ${VERSION}
   lm                       快捷打开交互菜单
   ${PROGRAM} init         进入基础初始化向导
   ${PROGRAM} status       查看系统、SSH、防火墙、BBR、DNS、IP 状态
-  ${PROGRAM} ports        进入防火墙与端口管理
+  ${PROGRAM} ports        选择宽松或收紧防火墙模式
   ${PROGRAM} swap         进入 Swap 管理
   ${PROGRAM} security     进入 Fail2ban 与自动安全更新
   ${PROGRAM} docker       进入 Docker 管理
   ${PROGRAM} hostname     设置主机名
-  ${PROGRAM} check-ai     执行内置 AI 连通性检测
-  ${PROGRAM} check-media  选择并运行第三方流媒体检测
+  ${PROGRAM} check-ai     检测 AI 与流媒体访问
+  ${PROGRAM} check-media  同 check-ai（兼容旧命令）
   ${PROGRAM} cleanup-system  执行带确认的保守系统清理
   ${PROGRAM} update       从 GitHub 更新 vps-manager
   ${PROGRAM} version
@@ -241,15 +241,17 @@ banner() {
 EOF
   printf '%s' "$C_RESET"
   printf '%s%s %s%s\n' "$C_BOLD" "$PROGRAM" "$VERSION" "$C_RESET"
-  printf "Ubuntu VPS 初始化、网络、SSH、防火墙与解锁检测工具\n\n"
+  printf "Ubuntu VPS 初始化、网络、SSH、防火墙与访问检测工具\n\n"
 }
 
 print_os_summary() {
   local pretty="unknown"
   if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    pretty="${PRETTY_NAME:-${ID:-unknown}}"
+    pretty="$(
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      printf '%s' "${PRETTY_NAME:-${ID:-unknown}}"
+    )"
   fi
   printf '系统：%s\n' "$pretty"
   printf '内核：%s\n' "$(uname -r)"
@@ -381,80 +383,138 @@ ensure_ufw() {
   return 1
 }
 
+ufw_is_active() {
+  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'
+}
+
+build_tight_firewall_rules() {
+  local ssh_rule rule
+  local -a defaults=()
+  local -A seen=()
+  ssh_rule="$(current_ssh_port)/tcp"
+  collect_port_rules "$DEFAULT_PORTS" || return 1
+  defaults=("${PORT_RULES[@]}")
+  PORT_RULES=()
+  PORT_RULES+=("$ssh_rule")
+  seen["$ssh_rule"]=1
+  for rule in "${defaults[@]}"; do
+    [[ "$rule" == "22/tcp" && "$ssh_rule" != "22/tcp" ]] && continue
+    [[ -n "${seen[$rule]:-}" ]] && continue
+    PORT_RULES+=("$rule")
+    seen["$rule"]=1
+  done
+}
+
 show_firewall_status() {
-  if command -v ufw >/dev/null 2>&1; then
-    ufw status verbose || true
+  local status allowed defaults
+  if ! command -v ufw >/dev/null 2>&1; then
+    printf 'UFW：未安装（宽松）\n'
+    return 0
+  fi
+  if ! ufw_is_active; then
+    printf 'UFW：已关闭（宽松）\n'
+    return 0
+  fi
+  status="$(ufw status verbose 2>/dev/null || true)"
+  allowed="$(printf '%s\n' "$status" | awk '$2=="ALLOW" && $1 !~ /^\(/ {print $1}' | sort -u | paste -sd, -)"
+  defaults="$(printf '%s\n' "$status" | awk -F': ' '/^Default:/{print $2; exit}')"
+  if [[ "$defaults" == *"deny (incoming)"* && "$defaults" == *"allow (outgoing)"* && "$defaults" == *"deny (routed)"* ]]; then
+    defaults="拒绝入站，允许出站，拒绝转发"
+  fi
+  printf 'UFW：已启用\n'
+  printf '默认策略：%s\n' "${defaults:-未读取到}"
+  printf '允许端口：%s\n' "${allowed:-未读取到}"
+}
+
+restore_ufw_backup() {
+  local backup_dir="$1" was_active="$2"
+  [[ -d "$backup_dir/ufw" ]] && cp -a -- "$backup_dir/ufw/." /etc/ufw/ 2>/dev/null || true
+  [[ -f "$backup_dir/default-ufw" ]] && install -m 0644 "$backup_dir/default-ufw" /etc/default/ufw 2>/dev/null || true
+  if (( was_active )); then
+    ufw --force enable >/dev/null 2>&1 || true
   else
-    printf 'ufw：未安装\n'
+    ufw disable >/dev/null 2>&1 || true
   fi
 }
 
-open_port_rules() {
-  local input="${1:-}" rule
-  ensure_ufw || return 1
-  if [[ -z "$input" ]]; then
-    read -r -p "需要开放的端口（逗号分隔，默认 ${DEFAULT_PORTS}）：" input
-    input="${input:-$DEFAULT_PORTS}"
+set_firewall_relaxed() {
+  require_root
+  require_ubuntu || return 1
+  if ! command -v ufw >/dev/null 2>&1 || ! ufw_is_active; then
+    ok "当前已经是宽松模式：UFW 未启用。"
+    return 0
   fi
-  collect_port_rules "$input" || return 1
-  (( ${#PORT_RULES[@]} > 0 )) || { error "没有有效端口。"; return 1; }
-  printf '准备开放：%s\n' "${PORT_RULES[*]}"
-  confirm "确认继续？" || return 0
-  for rule in "${PORT_RULES[@]}"; do
-    log_command interactive ufw allow "$rule" || return 1
-  done
-  ok "端口规则已添加。"
+  warn "宽松模式会关闭 UFW，主机不再过滤入站端口；云厂商安全组仍可能限制访问。"
+  confirm "确认切换到宽松模式？" || return 0
+  if log_command quiet ufw disable; then
+    ok "已切换到宽松模式：UFW 已关闭，现有规则保留。"
+    log_line "firewall mode changed to relaxed"
+  else
+    error "关闭 UFW 失败，请查看日志。"
+    return 1
+  fi
 }
 
-delete_port_rules() {
-  local input rule
+set_firewall_tight() {
+  local ssh_port backup_dir rule was_active=0 failed=0
+  require_root
+  require_ubuntu || return 1
   ensure_ufw || return 1
-  read -r -p "需要删除的 allow 端口（逗号分隔，例如 8080/tcp,53/udp）：" input
-  collect_port_rules "$input" || return 1
-  (( ${#PORT_RULES[@]} > 0 )) || { error "没有有效端口。"; return 1; }
-  printf '准备删除 allow 规则：%s\n' "${PORT_RULES[*]}"
-  confirm "确认继续？" || return 0
-  for rule in "${PORT_RULES[@]}"; do
-    log_command interactive ufw delete allow "$rule" || true
-  done
-  ok "端口删除命令已执行。"
-}
-
-enable_ufw() {
-  local ssh_port
-  ensure_ufw || return 1
+  build_tight_firewall_rules || return 1
   ssh_port="$(current_ssh_port)"
-  warn "脚本将在启用 UFW 前先放行当前 SSH TCP ${ssh_port}；云厂商安全组仍需自行确认。"
-  confirm "确认放行 SSH 并启用 ufw？" || return 0
-  log_command interactive ufw allow "${ssh_port}/tcp" comment "SSH before vps-manager" || return 1
-  log_command interactive ufw --force enable
-}
+  printf '\n%s收紧模式%s\n' "$C_BOLD" "$C_RESET"
+  printf '  当前 SSH：%s/tcp（最先放行）\n' "$ssh_port"
+  printf '  允许端口：%s\n' "${PORT_RULES[*]}"
+  printf '  默认策略：拒绝其他入站和转发，允许出站\n'
+  warn "将清空现有 UFW 规则并按以上清单重建；云厂商安全组仍需单独配置。"
+  confirm "确认切换到收紧模式？" || return 0
+  acquire_lock || return 1
 
-disable_ufw() {
-  ensure_ufw || return 1
-  warn "关闭防火墙会扩大暴露面，除排障外不建议长期关闭。"
-  confirm "确认关闭 ufw？" || return 0
-  log_command interactive ufw disable
+  ufw_is_active && was_active=1
+  backup_dir="/var/backups/vps-manager-ufw-$(date '+%Y%m%d-%H%M%S').$$"
+  install -d -m 0700 "$backup_dir" || return 1
+  cp -a -- /etc/ufw "$backup_dir/ufw" || { error "无法备份 UFW 配置。"; return 1; }
+  [[ ! -f /etc/default/ufw ]] || cp -a -- /etc/default/ufw "$backup_dir/default-ufw" || return 1
+
+  log_command quiet ufw --force reset || failed=1
+  (( failed )) || log_command quiet ufw default deny incoming || failed=1
+  (( failed )) || log_command quiet ufw default allow outgoing || failed=1
+  (( failed )) || log_command quiet ufw default deny routed || failed=1
+  (( failed )) || log_command quiet ufw logging low || failed=1
+  if (( failed == 0 )); then
+    for rule in "${PORT_RULES[@]}"; do
+      if ! log_command quiet ufw allow "$rule" comment "vps-manager tight mode"; then
+        failed=1
+        break
+      fi
+    done
+  fi
+  (( failed )) || log_command quiet ufw --force enable || failed=1
+
+  if (( failed )); then
+    restore_ufw_backup "$backup_dir" "$was_active"
+    error "收紧模式应用失败，已尝试恢复原配置。备份：${backup_dir}"
+    return 1
+  fi
+  ok "已切换到收紧模式，当前 SSH ${ssh_port}/tcp 保持放行。"
+  info "UFW 备份：${backup_dir}"
+  log_line "firewall mode changed to tight: ${PORT_RULES[*]}"
+  show_firewall_status
 }
 
 firewall_menu() {
   local choice
   require_root
   while true; do
-    printf '\n防火墙与端口：\n'
-    printf '  1. 查看 ufw 状态\n'
-    printf '  2. 开放端口\n'
-    printf '  3. 删除开放端口\n'
-    printf '  4. 启用 ufw\n'
-    printf '  5. 关闭 ufw\n'
+    printf '\n防火墙模式：\n'
+    show_firewall_status
+    printf '\n  1. 宽松模式（关闭 UFW）\n'
+    printf '  2. 收紧模式（只允许 SSH 和服务端口）\n'
     printf '  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
-      1) show_firewall_status; pause ;;
-      2) open_port_rules; pause ;;
-      3) delete_port_rules; pause ;;
-      4) enable_ufw; pause ;;
-      5) disable_ufw; pause ;;
+      1) set_firewall_relaxed; pause ;;
+      2) set_firewall_tight; pause ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -998,14 +1058,37 @@ ssh_menu() {
 }
 
 show_fail2ban_status() {
+  local status service_state enabled_state port="未知" current_failed=0 total_failed=0 current_banned=0 total_banned=0 banned_list=""
   if ! command -v fail2ban-client >/dev/null 2>&1; then
     printf 'Fail2ban：未安装\n'
     return 0
   fi
-  systemctl --no-pager --full status fail2ban 2>/dev/null | sed -n '1,8p' || true
-  printf '\nSSH jail：\n'
-  fail2ban-client status sshd 2>/dev/null || printf '  sshd jail 未运行\n'
-  [[ -f "$FAIL2BAN_JAIL_FILE" ]] && { printf '\n管理配置：%s\n' "$FAIL2BAN_JAIL_FILE"; sed -n '1,80p' "$FAIL2BAN_JAIL_FILE"; }
+  service_state="$(systemctl is-active fail2ban 2>/dev/null || true)"
+  enabled_state="$(systemctl is-enabled fail2ban 2>/dev/null || true)"
+  [[ "$service_state" == "active" ]] || {
+    printf 'Fail2ban：未运行\n'
+    printf '开机启动：%s\n' "${enabled_state:-未知}"
+    return 0
+  }
+  if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
+    port="$(awk -F= '/^[[:space:]]*port[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$FAIL2BAN_JAIL_FILE")"
+  fi
+  status="$(fail2ban-client status sshd 2>/dev/null || true)"
+  [[ -n "$status" ]] || {
+    printf 'Fail2ban：运行中\nSSH 保护：未启用\n'
+    return 0
+  }
+  current_failed="$(printf '%s\n' "$status" | awk -F: '/Currently failed/{gsub(/[[:space:]]/, "", $2); print $2}')"
+  total_failed="$(printf '%s\n' "$status" | awk -F: '/Total failed/{gsub(/[[:space:]]/, "", $2); print $2}')"
+  current_banned="$(printf '%s\n' "$status" | awk -F: '/Currently banned/{gsub(/[[:space:]]/, "", $2); print $2}')"
+  total_banned="$(printf '%s\n' "$status" | awk -F: '/Total banned/{gsub(/[[:space:]]/, "", $2); print $2}')"
+  banned_list="$(printf '%s\n' "$status" | awk -F: '/Banned IP list/{sub(/^[[:space:]]+/, "", $2); print $2}')"
+  printf 'Fail2ban：运行中\n'
+  printf 'SSH 保护：已启用（端口 %s）\n' "${port:-未知}"
+  printf '失败登录：当前 %s，累计 %s\n' "${current_failed:-0}" "${total_failed:-0}"
+  printf '封禁地址：当前 %s，累计 %s\n' "${current_banned:-0}" "${total_banned:-0}"
+  [[ -z "$banned_list" ]] || printf '当前名单：%s\n' "$banned_list"
+  printf '规则：10 分钟失败 5 次，封禁 1 小时\n'
 }
 
 sync_fail2ban_ssh_port() {
@@ -1090,17 +1173,22 @@ disable_fail2ban() {
 }
 
 show_auto_updates_status() {
-  if dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'install ok installed'; then
-    printf 'unattended-upgrades：已安装\n'
-  else
-    printf 'unattended-upgrades：未安装\n'
+  local list_state="未启用" upgrade_state="未启用" reboot_state="未明确关闭" timer_state="异常"
+  if ! dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'install ok installed'; then
+    printf '自动安全更新：未安装\n'
+    return 0
   fi
-  printf '\n自动更新周期配置：\n'
-  sed -n '1,80p' "$AUTO_UPGRADES_FILE" 2>/dev/null || printf '  未配置\n'
-  printf '\n脚本管理选项：\n'
-  sed -n '1,80p' "$AUTO_UPGRADES_OPTIONS_FILE" 2>/dev/null || printf '  未配置\n'
-  printf '\nAPT 定时器：\n'
-  systemctl list-timers apt-daily.timer apt-daily-upgrade.timer --no-pager 2>/dev/null || true
+  grep -q 'APT::Periodic::Update-Package-Lists "1";' "$AUTO_UPGRADES_FILE" 2>/dev/null && list_state="每天"
+  grep -q 'APT::Periodic::Unattended-Upgrade "1";' "$AUTO_UPGRADES_FILE" 2>/dev/null && upgrade_state="每天"
+  grep -q 'Unattended-Upgrade::Automatic-Reboot "false";' "$AUTO_UPGRADES_OPTIONS_FILE" 2>/dev/null && reboot_state="关闭"
+  if systemctl is-active --quiet apt-daily.timer 2>/dev/null && systemctl is-active --quiet apt-daily-upgrade.timer 2>/dev/null; then
+    timer_state="正常"
+  fi
+  printf '自动安全更新：已安装\n'
+  printf '软件包列表更新：%s\n' "$list_state"
+  printf '安全更新安装：%s\n' "$upgrade_state"
+  printf '自动重启：%s\n' "$reboot_state"
+  printf 'APT 定时器：%s\n' "$timer_state"
 }
 
 enable_auto_updates() {
@@ -1166,99 +1254,59 @@ security_menu() {
   done
 }
 
-curl_probe() {
-  local label="$1" url="$2" family="$3" family_arg=()
-  command -v curl >/dev/null 2>&1 || { warn "缺少 curl，跳过 ${label}。"; return 0; }
-  [[ "$family" == "4" ]] && family_arg=(-4)
-  [[ "$family" == "6" ]] && family_arg=(-6)
-  printf '%s IPv%s: ' "$label" "$family"
-  curl "${family_arg[@]}" -sS -L -o /dev/null -m 12 \
-    -w 'HTTP %{http_code}, remote=%{remote_ip}, time=%{time_total}s\n' "$url" 2>&1 || printf '访问失败\n'
+http_access_status() {
+  local url="$1" code
+  code="$(curl -4 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' \
+    -sS -L --connect-timeout 4 -m 10 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+  case "$code" in
+    2??|3??|400|401|404|405|409|422|429) printf '可以访问' ;;
+    403|451) printf '不可访问' ;;
+    *) printf '检测失败' ;;
+  esac
+}
+
+show_access_origin() {
+  local trace ip country
+  trace="$(curl -4 -fsS --connect-timeout 4 -m 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+  ip="$(printf '%s\n' "$trace" | awk -F= '$1=="ip" {print $2; exit}')"
+  country="$(printf '%s\n' "$trace" | awk -F= '$1=="loc" {print $2; exit}')"
+  printf '公网 IPv4：%s\n' "${ip:-不可用}"
+  printf '出口地区：%s\n' "${country:-未知}"
+}
+
+check_service_access() {
+  local temporary i status
+  local -a labels=(OpenAI Gemini Claude Netflix Disney+ YouTube)
+  local -a urls=(
+    "https://api.openai.com/v1/models"
+    "https://gemini.google.com/"
+    "https://claude.ai/"
+    "https://www.netflix.com/"
+    "https://www.disneyplus.com/"
+    "https://www.youtube.com/premium"
+  )
+  command -v curl >/dev/null 2>&1 || { error "缺少 curl，无法执行访问检测。"; return 1; }
+  temporary="$(mktemp -d /tmp/vps-manager-access.XXXXXX)" || return 1
+  printf '\n%sAI 与流媒体访问检测%s\n' "$C_BOLD" "$C_RESET"
+  show_access_origin
+  printf '\n'
+  for i in "${!labels[@]}"; do
+    http_access_status "${urls[$i]}" > "$temporary/$i" &
+  done
+  wait
+  for i in "${!labels[@]}"; do
+    status="$(<"$temporary/$i")"
+    printf '  %-10s %s\n' "${labels[$i]}" "${status:-检测失败}"
+  done
+  rm -f -- "$temporary"/{0..5}
+  rmdir -- "$temporary" 2>/dev/null || true
+  printf '\n结果只代表当前 VPS 的网络可达性，不代表账号、订阅或具体内容一定可用。\n'
 }
 
 show_public_ip() {
   command -v curl >/dev/null 2>&1 || { warn "缺少 curl，无法获取公网 IP。"; return 0; }
   printf 'IPv4：%s\n' "$(curl -4 -fsS -m 8 https://api64.ipify.org 2>/dev/null || printf '不可用')"
   printf 'IPv6：%s\n' "$(curl -6 -fsS -m 8 https://api64.ipify.org 2>/dev/null || printf '不可用')"
-}
-
-resolve_host() {
-  local host="$1"
-  printf '%s：' "$host"
-  getent ahosts "$host" 2>/dev/null | awk 'NR <= 4 {printf "%s%s", sep, $1; sep=", "} END {printf "\n"}' || printf '解析失败\n'
-}
-
-check_ai_connectivity() {
-  info "基础连通性检测只判断网络可达性，不代表账号、套餐或地区一定可用。"
-  printf '\n公网 IP：\n'
-  show_public_ip
-  printf '\nDNS 解析：\n'
-  resolve_host openai.com
-  resolve_host api.openai.com
-  resolve_host chatgpt.com
-  resolve_host chat.openai.com
-  printf '\nHTTP 探测：\n'
-  curl_probe "OpenAI API" "https://api.openai.com/v1/models" 4
-  curl_probe "OpenAI API" "https://api.openai.com/v1/models" 6
-  curl_probe "ChatGPT" "https://chatgpt.com/cdn-cgi/trace" 4
-  curl_probe "ChatGPT" "https://chatgpt.com/cdn-cgi/trace" 6
-  curl_probe "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 4
-  curl_probe "chat.openai.com" "https://chat.openai.com/cdn-cgi/trace" 6
-}
-
-run_remote_script() {
-  local name="$1" url="$2"
-  shift 2
-  local temp_file rc
-  ensure_command curl curl || return 1
-  [[ "$url" == https://* ]] || { error "仅允许从 HTTPS 地址下载检测脚本。"; return 1; }
-  printf '即将运行第三方脚本：%s\n来源：%s\n' "$name" "$url"
-  warn "第三方检测脚本会从远程下载并执行，请确认你信任该来源。"
-  confirm "确认继续？" || return 0
-
-  temp_file="$(mktemp /tmp/vps-manager-remote.XXXXXX.sh)" || return 1
-  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$url" -o "$temp_file"; then
-    rm -f "$temp_file"
-    error "下载第三方脚本失败。"
-    return 1
-  fi
-  if [[ ! -s "$temp_file" ]]; then
-    rm -f -- "$temp_file"
-    error "下载结果为空，拒绝执行。"
-    return 1
-  fi
-  if ! bash -n "$temp_file"; then
-    rm -f -- "$temp_file"
-    error "下载的第三方脚本未通过 Bash 语法检查，拒绝执行。"
-    return 1
-  fi
-  log_command interactive bash "$temp_file" "$@"
-  rc=$?
-  rm -f "$temp_file"
-  return "$rc"
-}
-
-check_media_menu() {
-  local choice
-  while true; do
-    printf '\nAI/流媒体解锁检测：\n'
-    printf '  1. 内置 AI 基础连通性检测\n'
-    printf '  2. RegionRestrictionCheck 全量检测\n'
-    printf '  3. RegionRestrictionCheck 仅 IPv4\n'
-    printf '  4. RegionRestrictionCheck 仅 IPv6\n'
-    printf '  5. MediaUnlockTest 备用检测\n'
-    printf '  0. 返回\n'
-    read -r -p "请选择：" choice
-    case "$choice" in
-      1) check_ai_connectivity; pause ;;
-      2) run_remote_script "RegionRestrictionCheck" "https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh"; pause ;;
-      3) run_remote_script "RegionRestrictionCheck IPv4" "https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh" -M 4; pause ;;
-      4) run_remote_script "RegionRestrictionCheck IPv6" "https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh" -M 6; pause ;;
-      5) run_remote_script "MediaUnlockTest" "https://unlock.icmp.ing/scripts/test.sh"; pause ;;
-      0) return 0 ;;
-      *) error "无效选项。"; pause ;;
-    esac
-  done
 }
 
 show_docker_status() {
@@ -1284,9 +1332,11 @@ install_docker_official() {
   local -a conflicts=() conflict_packages=(docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)
   require_root
   require_ubuntu || return 1
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+  codename="$(
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+  )"
   architecture="$(dpkg --print-architecture)"
   [[ -n "$codename" && -n "$architecture" ]] || { error "无法识别 Ubuntu 代号或架构。"; return 1; }
   case "$architecture" in
@@ -1408,6 +1458,8 @@ show_status() {
   bbr_status
   printf '\nFail2ban：\n'
   show_fail2ban_status
+  printf '\n自动安全更新：\n'
+  show_auto_updates_status
   printf '\nDocker：\n'
   show_docker_status
   printf '\nDNS：\n'
@@ -1415,10 +1467,16 @@ show_status() {
 }
 
 show_log() {
-  if [[ -f "$LOG_FILE" ]]; then
-    tail -n 120 "$LOG_FILE"
+  local events
+  if [[ ! -f "$LOG_FILE" ]]; then
+    info "暂无操作记录。"
+    return 0
+  fi
+  events="$(grep -E '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} ' "$LOG_FILE" 2>/dev/null | tail -n 20 || true)"
+  if [[ -n "$events" ]]; then
+    printf '%s\n' "$events"
   else
-    info "暂无日志。"
+    info "暂无操作记录。"
   fi
 }
 
@@ -1547,8 +1605,7 @@ init_wizard() {
   if confirm "是否安装 Docker 官方版本？"; then
     install_docker_official || warn "Docker 步骤未完成。"
   fi
-  if confirm "是否进入防火墙与端口向导？"; then
-    open_port_rules "$DEFAULT_PORTS" || warn "默认端口放行未完成。"
+  if confirm "是否配置防火墙模式？"; then
     firewall_menu
   fi
   if confirm "是否进入 DNS 配置向导？"; then
@@ -1633,13 +1690,13 @@ main_menu() {
     printf '  2. 系统升级、主机名、时区与重启\n'
     printf '  3. SSH/root 登录设置\n'
     printf '  4. Fail2ban 与自动安全更新\n'
-    printf '  5. 防火墙与端口\n'
+    printf '  5. 防火墙模式\n'
     printf '  6. BBR 与网络优化\n'
     printf '  7. Swap 管理\n'
     printf '  8. Docker 管理\n'
     printf '  9. DNS 配置\n'
-    printf ' 10. AI/流媒体解锁检测\n'
-    printf ' 11. 系统状态与最近日志\n'
+    printf ' 10. AI/流媒体访问检测\n'
+    printf ' 11. 系统状态与最近操作\n'
     printf ' 12. 保守系统清理\n'
     printf ' 13. 更新 vps-manager\n'
     printf '  0. 退出\n'
@@ -1655,8 +1712,8 @@ main_menu() {
       7) swap_menu ;;
       8) docker_menu ;;
       9) dns_menu ;;
-      10) check_media_menu ;;
-      11) show_status; printf '\n最近日志：\n'; show_log; pause ;;
+      10) check_service_access; pause ;;
+      11) show_status; printf '\n最近操作：\n'; show_log; pause ;;
       12) safe_system_cleanup; pause ;;
       13)
         if update_manager; then
@@ -1683,8 +1740,7 @@ main() {
     security) security_menu ;;
     docker) docker_menu ;;
     hostname) shift; set_hostname "${1:-}" ;;
-    check-ai) check_ai_connectivity ;;
-    check-media) check_media_menu ;;
+    check-ai|check-media) check_service_access ;;
     cleanup-system) safe_system_cleanup ;;
     update|update-manager) update_manager ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
