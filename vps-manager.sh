@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"

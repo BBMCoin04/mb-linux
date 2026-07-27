@@ -4,13 +4,14 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 DEFAULT_REPO="BBMCoin04/mb-linux"
 REPO="${VPS_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${VPS_MANAGER_REF:-main}"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
-SOURCE_URL="${VPS_MANAGER_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/vps-manager.sh}"
+CACHE_BUST="$(date +%s)"
+SOURCE_URL="${VPS_MANAGER_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/vps-manager.sh?ts=${CACHE_BUST}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
 BUNDLED_SOURCE=""
 if [[ -z "${VPS_MANAGER_SOURCE_URL+x}" && -n "$SCRIPT_DIR" && -s "${SCRIPT_DIR}/vps-manager.sh" ]]; then

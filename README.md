@@ -1,6 +1,6 @@
 # mb-linux / vps-manager
 
-`vps-manager 1.2.2` 是一个面向 Ubuntu VPS 的中文管理脚本，用菜单完成系统初始化、SSH、防火墙、BBR、Swap、Docker、DNS 和日常维护。
+`vps-manager 1.2.3` 是一个面向 Ubuntu VPS 的中文管理脚本，用菜单完成系统初始化、SSH、防火墙、BBR、Swap、Docker、DNS 和日常维护。
 
 > 仅支持 Ubuntu。修改 SSH、防火墙或网络前，请保留当前 SSH 会话，并确保可以使用云厂商控制台救援。
 
@@ -9,7 +9,7 @@
 推荐先下载，再执行：
 
 ```bash
-curl -fsSLo /tmp/vps-manager-install.sh https://raw.githubusercontent.com/BBMCoin04/mb-linux/main/install.sh
+curl -fsSLo /tmp/vps-manager-install.sh "https://raw.githubusercontent.com/BBMCoin04/mb-linux/main/install.sh?ts=$(date +%s)"
 sudo bash /tmp/vps-manager-install.sh
 ```
 
