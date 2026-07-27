@@ -1,313 +1,140 @@
 # mb-linux / vps-manager
 
-`vps-manager 1.2.0` 是面向 Ubuntu VPS 的交互式初始化与日常维护工具，适合新机器开通后统一处理：
+`vps-manager 1.2.0` 是一个面向 Ubuntu VPS 的中文管理脚本，用菜单完成系统初始化、SSH、防火墙、BBR、Swap、Docker、DNS 和日常维护。
 
-- 完整系统升级与重启提示
-- 主机名、时区和常用依赖
-- SSH/root 登录设置
-- UFW 与端口
-- BBR
-- Swap
-- Fail2ban
-- unattended-upgrades 自动安全更新
-- Docker 官方 Ubuntu 仓库安装
-- DNS
-- AI/流媒体网络检测
-- 带确认的保守系统清理
-
-所有关键修改都显示影响并请求确认。脚本不会自动关闭 SSH、防火墙或删除 Docker 数据。
+> 仅支持 Ubuntu。修改 SSH、防火墙或网络前，请保留当前 SSH 会话，并确保可以使用云厂商控制台救援。
 
 ## 安装
 
-推荐先下载再执行：
+推荐先下载，再执行：
 
 ```bash
 curl -fsSLo /tmp/vps-manager-install.sh https://raw.githubusercontent.com/BBMCoin04/mb-linux/main/install.sh
 sudo bash /tmp/vps-manager-install.sh
 ```
 
-快速方式：
+从 ZIP 或 Git 仓库安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-linux/main/install.sh | sudo bash
+sudo bash install.sh
 ```
 
-从完整 ZIP 或仓库运行 `sudo bash install.sh` 时，安装器优先使用同目录中的 `vps-manager.sh`；只有单独下载 `install.sh` 时才从 HTTPS 获取主程序。
-
-安装路径：
-
-```text
-/usr/local/sbin/vps-manager
-/usr/local/sbin/lm -> /usr/local/sbin/vps-manager
-```
-
-重新打开菜单：
+安装完成后，随时打开菜单：
 
 ```bash
 sudo lm
-# 或
+```
+
+也可以使用完整命令：
+
+```bash
 sudo vps-manager
 ```
 
 ## 主菜单
 
 ```text
-1.  基础初始化向导
-2.  系统升级、主机名、时区与重启
-3.  SSH/root 登录设置
-4.  Fail2ban 与自动安全更新
-5.  防火墙与端口
-6.  BBR 与网络优化
-7.  Swap 管理
-8.  Docker 管理
-9.  DNS 配置
-10. AI/流媒体解锁检测
-11. 系统状态与最近日志
-12. 保守系统清理
-13. 更新 vps-manager
-0.  退出
+  1. 基础初始化向导
+  2. 系统升级、主机名、时区与重启
+  3. SSH/root 登录设置
+  4. Fail2ban 与自动安全更新
+  5. 防火墙与端口
+  6. BBR 与网络优化
+  7. Swap 管理
+  8. Docker 管理
+  9. DNS 配置
+ 10. AI/流媒体解锁检测
+ 11. 系统状态与最近日志
+ 12. 保守系统清理
+ 13. 更新 vps-manager
+  0. 退出
 ```
 
-## 新 VPS 推荐顺序
+## 新 VPS 怎么用
 
-运行：
+第一次使用直接选择菜单 `1`，脚本会逐项询问：
 
-```bash
-sudo vps-manager init
-```
+1. 设置主机名和时区。
+2. 升级 Ubuntu 并安装常用工具。
+3. 创建 Swap、启用 BBR。
+4. 配置 Fail2ban 和自动安全更新。
+5. 安装 Docker。
+6. 配置 UFW 端口和 DNS。
 
-向导逐项询问以下操作，任何一项都可以跳过：
+每一步都可以跳过。脚本不会静默重启 VPS。
 
-1. 设置主机名。
-2. `apt-get full-upgrade` 完整系统升级。
-3. 设置 `Asia/Shanghai` 时区。
-4. 安装常用依赖。
-5. 创建 Swap。
-6. 启用 BBR。
-7. 安装 Fail2ban SSH jail。
-8. 启用自动安全更新。
-9. 安装 Docker 官方版本。
-10. 配置 UFW 和端口。
-11. 配置 DNS。
+## 重要提醒
 
-系统升级后仅在 `/var/run/reboot-required` 存在时提示重启。BBR 通常即时生效，脚本会说明无需重启，但仍提供可选重启确认。
+- 修改 SSH 端口前，先在云厂商安全组中放行新端口。
+- 修改 SSH 时保持当前连接，并用新窗口测试成功后再关闭旧连接。
+- 没有配置并测试 SSH 公钥前，不要关闭密码登录。
+- UFW 不能代替云厂商安全组；两边都要正确放行端口。
+- 加入 `docker` 用户组等同于获得 root 级权限，不要随意添加用户。
+- 第三方流媒体检测脚本只会在你确认后下载并运行。
 
-## 主机名与系统升级
-
-主机名只接受最长 63 位的小写字母、数字和连字符。修改使用 `hostnamectl`，并同步 `/etc/hosts` 的 `127.0.1.1` 条目；修改前备份 hosts 文件。
-
-系统升级使用：
-
-```bash
-apt-get update
-apt-get full-upgrade -y
-```
-
-完整升级可能安装新内核。脚本不会静默重启；立即重启始终需要确认。
-
-## SSH 安全
-
-SSH 设置写入独立文件：
+默认开放端口为：
 
 ```text
-/etc/ssh/sshd_config.d/00-vps-manager.conf
+22/tcp, 80/tcp, 443/tcp, 443/udp,
+8443/tcp, 8443/udp, 2087/tcp
 ```
 
-支持：
-
-- 查看最终生效配置。
-- 开启/关闭 root 登录。
-- 开启/关闭密码登录。
-- 修改 SSH 端口。
-
-每次修改都会：
-
-1. 备份旧的脚本管理文件。
-2. 执行 `sshd -t` 语法测试。
-3. 读取 `sshd -T` 确认最终生效值。
-4. 成功后 reload SSH。
-5. 失败时恢复旧配置。
-
-关闭密码登录前必须检测到至少一个非空 `authorized_keys`。修改 SSH 端口时，如果 UFW 已启用，会先放行新端口；旧端口不会自动删除，便于新会话验证后回退。云厂商安全组仍需手动放行。
-
-## UFW 与默认端口
-
-新 VPS 默认端口列表：
-
-```text
-22/tcp
-80/tcp
-443/tcp
-443/udp
-8443/tcp
-8443/udp
-2087/tcp
-```
-
-`2096/TCP` 是 Cloudflare Argo 边缘端口，不需要在 VPS 入站开放。
-
-启用 UFW 前，脚本会从 `sshd -T` 读取当前 SSH 端口并先放行。UFW 不能替代云厂商安全组；Docker 发布端口也不会由本脚本自动开放。
-
-## BBR
-
-启用 BBR 写入：
-
-```text
-/etc/sysctl.d/99-vps-manager-bbr.conf
-```
-
-仅在当前内核提供 BBR 时写入，并立即执行 `sysctl --system`。菜单可删除脚本自己的 BBR 文件，不修改其他 sysctl 配置。
-
-## Swap
-
-默认管理：
-
-```text
-/swapfile
-/etc/sysctl.d/99-vps-manager-swap.conf
-```
-
-创建时：
-
-- 支持 1-64 GiB整数。
-- 检查磁盘空间并至少保留 512 MiB。
-- 优先使用 `fallocate`，失败时回退 `dd`。
-- 设置权限 `0600`。
-- 写入 `/etc/fstab`。
-- 默认设置 `vm.swappiness=10`。
-
-删除时只处理脚本配置的 Swap 文件和对应 fstab 条目，不删除其他 Swap。若内存不足导致 `swapoff` 失败，会停止删除。
-
-## Fail2ban
-
-管理文件：
-
-```text
-/etc/fail2ban/jail.d/vps-manager-sshd.local
-```
-
-默认 SSH 策略：
-
-```text
-5 次失败 / 10 分钟
-封禁 1 小时
-backend = systemd
-```
-
-Fail2ban 自动读取当前 SSH 端口；通过脚本修改 SSH 端口后 jail 会同步更新。关闭功能只删除此 jail，不卸载 Fail2ban，也不删除其他 jail。
-
-Fail2ban 只能降低在线暴力破解风险，不能替代强密码、公钥登录、云安全组和及时更新。
-
-## 自动安全更新
-
-安装 Ubuntu 官方 `unattended-upgrades`，使用包自带的安全更新来源。管理文件：
-
-```text
-/etc/apt/apt.conf.d/20auto-upgrades
-/etc/apt/apt.conf.d/52vps-manager-unattended-upgrades
-```
-
-默认行为：
-
-- 每日更新软件包列表。
-- 每日执行 unattended-upgrades。
-- 清理无用内核和新依赖。
-- **不自动重启**。
-
-关闭时不卸载软件包，只关闭周期配置并删除脚本附加选项。
+请按实际用途调整，不需要的端口不要开放。
 
 ## 保守系统清理
 
-主菜单 `12` 或命令 `sudo vps-manager cleanup-system` 会先展示完整范围并要求确认，只执行：
-
-- `apt-get clean` 清理 APT 下载缓存，不卸载软件。
-- `systemd-tmpfiles --clean` 按系统策略清理过期临时文件。
-- `journalctl --vacuum-time=14d` 清理 14 天以前的 journal 归档。
-- 管理器日志超过 5 MiB 时保留最近 2000 行。
-
-不会执行 `autoremove`、Docker prune、证书或密钥删除、用户目录扫描、防火墙清空或手工批量删除。命令会统计根分区执行前后的占用差值；如果日志或缓存位于其他挂载点，显示的释放量可能低于实际值。
-
-## Docker
-
-Docker 安装严格使用官方 Ubuntu apt 流程：
-
-```text
-/etc/apt/keyrings/docker.asc
-/etc/apt/sources.list.d/docker.sources
-```
-
-安装包：
-
-```text
-docker-ce
-docker-ce-cli
-containerd.io
-docker-buildx-plugin
-docker-compose-plugin
-```
-
-脚本检测官方支持架构和已知 Ubuntu 代号。若检测到 `docker.io`、`containerd`、`runc` 等冲突包，会显示列表并单独请求确认后才移除；不会删除 `/var/lib/docker`。
-
-菜单还支持：
-
-- 查看 Engine、Compose、Buildx 和 systemd 状态。
-- 将现有用户加入 `docker` 组。
-- 运行 `hello-world` 测试。
-
-`docker` 组权限实际等同 root，因此不会自动添加用户。
-
-## DNS 与检测
-
-DNS 优先通过 `systemd-resolved` 配置，无法使用时才回退 `/etc/resolv.conf`。内置 Cloudflare、Google、Quad9 和自定义方案，修改前创建备份。
-
-AI 基础检测只检查 DNS、IPv4/IPv6 公网地址和 HTTP 可达性，不代表账号或地区一定可用。
-
-第三方流媒体脚本仅在用户确认后下载到临时文件执行：
-
-- RegionRestrictionCheck
-- MediaUnlockTest
-
-## CLI
+选择菜单 `12`，或运行：
 
 ```bash
-sudo vps-manager
-sudo lm
-sudo vps-manager init
-sudo vps-manager system
-sudo vps-manager status
-sudo vps-manager ports
-sudo vps-manager swap
-sudo vps-manager security
-sudo vps-manager docker
-sudo vps-manager hostname my-vps-01
-sudo vps-manager check-ai
-sudo vps-manager check-media
-sudo vps-manager cleanup-system
-sudo vps-manager update
-vps-manager version
-vps-manager help
+sudo lm cleanup-system
 ```
 
-日志：
+确认后只会清理：
+
+- APT 下载缓存。
+- 系统策略认定的过期临时文件。
+- 14 天以前的 systemd journal 归档。
+- 超过 5 MiB 的 vps-manager 日志旧记录。
+
+不会执行 `autoremove`、Docker prune，不会删除证书、密钥、用户文件或防火墙规则。
+
+## 更新与修复
+
+选择菜单 `13`，或运行：
+
+```bash
+sudo lm update
+```
+
+更新会检查脚本标识、Bash 语法和版本，拒绝降级；失败时尝试恢复原版本。更新成功后会自动打开新版菜单。
+
+需要重新安装或修复 `lm` 命令时，重新执行安装命令即可。
+
+## 常用命令
+
+```bash
+sudo lm                 # 打开菜单
+sudo lm init            # 基础初始化向导
+sudo lm status          # 查看系统状态
+sudo lm ports           # 防火墙与端口
+sudo lm swap            # Swap 管理
+sudo lm security        # Fail2ban 与自动安全更新
+sudo lm docker          # Docker 管理
+sudo lm cleanup-system  # 保守系统清理
+sudo lm update          # 更新管理器
+lm version              # 查看版本
+lm help                 # 查看帮助
+```
+
+安装位置：
+
+```text
+/usr/local/sbin/vps-manager
+/usr/local/sbin/lm -> /usr/local/sbin/vps-manager
+```
+
+日志位置：
 
 ```text
 /var/log/vps-manager/vps-manager.log
 ```
-
-## 更新与回归
-
-主菜单 `13` 或命令 `sudo vps-manager update` 可直接更新管理器，成功后自动重新载入新版菜单。安装器和管理器更新都会检查主程序标识、Bash 语法及语义化版本；安装目标不允许是软链接，快捷命令不会覆盖其他程序，安装或自检失败时恢复原版本，远程版本低于已安装版本时拒绝覆盖。需要重新安装或修复命令入口时，重新运行 `install.sh`。
-
-开发行为测试：
-
-```bash
-./tests/behavior.sh
-```
-
-现有测试覆盖端口解析、默认端口数量、子菜单返回、帮助和版本。实际系统修改应继续在新 Ubuntu VPS 上验证，因为沙箱不能模拟 systemd、UFW、sshd、Swap、Fail2ban 和 Docker daemon 的完整行为。
-
-## 支持范围
-
-修改类操作仅支持 Ubuntu。Docker 官方流程按当前文档支持 Ubuntu 22.04、24.04、25.10、26.04 及官方列出的架构。
-
-修改 SSH、防火墙或网络前，建议始终保留云厂商控制台和一个现有 SSH 会话用于回退。
