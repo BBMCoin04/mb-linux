@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.2.4"
+VERSION="1.3.0"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
@@ -17,6 +17,8 @@ BACKUP_ROOT="${VPS_MANAGER_BACKUP_ROOT:-/var/backups/vps-manager}"
 LOCK_FILE="/run/lock/vps-manager.lock"
 DEFAULT_TIMEZONE="${DEFAULT_TIMEZONE:-Asia/Shanghai}"
 DEFAULT_PORTS="${DEFAULT_PORTS:-22/tcp,80/tcp,443/tcp,443/udp,8443/tcp,8443/udp,2087/tcp}"
+CONFIG_ROOT="${VPS_MANAGER_CONFIG_ROOT:-/etc/vps-manager}"
+PORT_CONFIG_FILE="${VPS_MANAGER_PORT_CONFIG_FILE:-${CONFIG_ROOT}/ports.conf}"
 SWAP_FILE="${VPS_MANAGER_SWAP_FILE:-/swapfile}"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-vps-manager-swap.conf"
 FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/vps-manager-sshd.local"
@@ -239,7 +241,7 @@ ${PROGRAM} ${VERSION}
   lm                       快捷打开交互菜单
   ${PROGRAM} init         进入基础初始化向导
   ${PROGRAM} status       查看系统、SSH、防火墙、BBR、DNS、IP 状态
-  ${PROGRAM} ports        选择宽松或收紧防火墙模式
+  ${PROGRAM} ports        管理防火墙模式和端口
   ${PROGRAM} swap         进入 Swap 管理
   ${PROGRAM} security     进入 Fail2ban 与自动安全更新
   ${PROGRAM} docker       进入 Docker 管理
@@ -378,21 +380,64 @@ normalize_port_rule() {
   return 1
 }
 
-collect_port_rules() {
-  local input="${1:-}" item rule
-  PORT_RULES=()
+declare -a PORT_RULES=()
+declare -a MANAGED_PORTS=()
+
+load_managed_service_ports() {
+  local item rule source
+  local -A seen=()
+  MANAGED_PORTS=()
+  if [[ -f "$PORT_CONFIG_FILE" ]]; then
+    source="$(grep -Ev '^[[:space:]]*(#|$)' "$PORT_CONFIG_FILE" 2>/dev/null || true)"
+  else
+    source="$(printf '%s\n' "$DEFAULT_PORTS" | tr ',' '\n' | grep -vx '22/tcp' || true)"
+  fi
   while IFS= read -r item; do
     item="$(trim "$item")"
     [[ -z "$item" ]] && continue
-    if ! rule="$(normalize_port_rule "$item")"; then
-      error "端口格式不正确：${item}。示例：443、443/tcp、53/udp"
-      return 1
-    fi
-    PORT_RULES+=("$rule")
-  done < <(printf '%s\n' "$input" | tr ',' '\n')
+    rule="$(normalize_port_rule "$item")" || { warn "忽略无效的端口配置：${item}"; continue; }
+    [[ -n "${seen[$rule]:-}" ]] && continue
+    MANAGED_PORTS+=("$rule")
+    seen["$rule"]=1
+  done <<< "$source"
 }
 
-declare -a PORT_RULES=()
+save_managed_service_ports() {
+  local temporary rule
+  install -d -m 0755 "$(dirname "$PORT_CONFIG_FILE")" || return 1
+  temporary="$(mktemp /tmp/vps-manager-ports.XXXXXX)" || return 1
+  {
+    printf '# Managed by vps-manager. One port/protocol per line.\n'
+    for rule in "${MANAGED_PORTS[@]}"; do
+      printf '%s\n' "$rule"
+    done
+  } > "$temporary"
+  if [[ -f "$PORT_CONFIG_FILE" ]]; then
+    backup_file "$PORT_CONFIG_FILE" || { rm -f -- "$temporary"; return 1; }
+  fi
+  if ! atomic_install_file "$temporary" "$PORT_CONFIG_FILE" 0644; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
+}
+
+managed_port_exists() {
+  local target="$1" rule
+  for rule in "${MANAGED_PORTS[@]}"; do
+    [[ "$rule" == "$target" ]] && return 0
+  done
+  return 1
+}
+
+remove_managed_port() {
+  local target="$1" rule
+  local -a remaining=()
+  for rule in "${MANAGED_PORTS[@]}"; do
+    [[ "$rule" == "$target" ]] || remaining+=("$rule")
+  done
+  MANAGED_PORTS=("${remaining[@]}")
+}
 
 ensure_ufw() {
   require_root
@@ -414,16 +459,12 @@ ufw_is_active() {
 
 build_tight_firewall_rules() {
   local ssh_rule rule
-  local -a defaults=()
   local -A seen=()
   ssh_rule="$(current_ssh_port)/tcp"
-  collect_port_rules "$DEFAULT_PORTS" || return 1
-  defaults=("${PORT_RULES[@]}")
-  PORT_RULES=()
-  PORT_RULES+=("$ssh_rule")
+  load_managed_service_ports
+  PORT_RULES=("$ssh_rule")
   seen["$ssh_rule"]=1
-  for rule in "${defaults[@]}"; do
-    [[ "$rule" == "22/tcp" && "$ssh_rule" != "22/tcp" ]] && continue
+  for rule in "${MANAGED_PORTS[@]}"; do
     [[ -n "${seen[$rule]:-}" ]] && continue
     PORT_RULES+=("$rule")
     seen["$rule"]=1
@@ -441,7 +482,7 @@ show_firewall_status() {
     return 0
   fi
   status="$(ufw status verbose 2>/dev/null || true)"
-  allowed="$(printf '%s\n' "$status" | awk '$2=="ALLOW" && $1 !~ /^\(/ {print $1}' | sort -u | paste -sd, -)"
+  allowed="$(printf '%s\n' "$status" | awk '$2=="ALLOW" && $1 !~ /^\(/ && !seen[$1]++ {print $1}' | paste -sd, -)"
   defaults="$(printf '%s\n' "$status" | awk -F': ' '/^Default:/{print $2; exit}')"
   if [[ "$defaults" == *"deny (incoming)"* && "$defaults" == *"allow (outgoing)"* && "$defaults" == *"deny (routed)"* ]]; then
     defaults="拒绝入站，允许出站，拒绝转发"
@@ -449,6 +490,141 @@ show_firewall_status() {
   printf 'UFW：已启用\n'
   printf '默认策略：%s\n' "${defaults:-未读取到}"
   printf '允许端口：%s\n' "${allowed:-未读取到}"
+}
+
+ufw_rule_exists() {
+  local target="$1"
+  command -v ufw >/dev/null 2>&1 || return 1
+  ufw show added 2>/dev/null | awk -v target="$target" '$1=="ufw" && $2=="allow" && $3==target {found=1} END {exit !found}'
+}
+
+port_listener_summary() {
+  local rule="$1" port proto lines names
+  port="${rule%/*}"
+  proto="${rule#*/}"
+  command -v ss >/dev/null 2>&1 || { printf '无法检测（缺少 ss）'; return 0; }
+  lines="$(ss -H -lntup 2>/dev/null | awk -v proto="$proto" -v port="$port" '
+    $1==proto {
+      local_endpoint=$5
+      sub(/^.*:/, "", local_endpoint)
+      if (local_endpoint==port) print
+    }
+  ')"
+  [[ -n "$lines" ]] || { printf '未检测到监听服务'; return 0; }
+  names="$(printf '%s\n' "$lines" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | paste -sd, -)"
+  if [[ -n "$names" ]]; then
+    printf '%s' "$names"
+  else
+    printf '检测到监听（服务名未知）'
+  fi
+}
+
+show_port_details() {
+  local rule="$1" firewall_state listener
+  listener="$(port_listener_summary "$rule")"
+  if ufw_rule_exists "$rule"; then
+    if ufw_is_active; then
+      firewall_state="已开放"
+    else
+      firewall_state="规则已保存，UFW 当前关闭"
+    fi
+  elif ufw_is_active; then
+    firewall_state="未开放"
+  else
+    firewall_state="UFW 已关闭，主机当前不拦截"
+  fi
+  printf '端口：%s\n' "$rule"
+  printf '防火墙：%s\n' "$firewall_state"
+  printf '监听服务：%s\n' "$listener"
+}
+
+prompt_port_rule() {
+  local input rule
+  read -r -p "请输入端口（例如 8080、8080/tcp、53/udp）：" input
+  if ! rule="$(normalize_port_rule "$input")"; then
+    error "端口格式不正确。"
+    return 1
+  fi
+  printf '%s\n' "$rule"
+}
+
+open_managed_port() {
+  local rule ssh_rule was_rule=0
+  local -a previous=()
+  require_root
+  require_ubuntu || return 1
+  ensure_ufw || return 1
+  rule="$(prompt_port_rule)" || return 1
+  ssh_rule="$(current_ssh_port)/tcp"
+  load_managed_service_ports
+  previous=("${MANAGED_PORTS[@]}")
+  ufw_rule_exists "$rule" && was_rule=1
+  printf '\n'
+  show_port_details "$rule"
+  if (( was_rule )) && { [[ "$rule" == "$ssh_rule" ]] || managed_port_exists "$rule"; }; then
+    info "${rule} 已在允许清单中。"
+    return 0
+  fi
+  confirm "确认开放 ${rule}？" || return 0
+  if [[ "$rule" != "$ssh_rule" ]] && ! managed_port_exists "$rule"; then
+    MANAGED_PORTS+=("$rule")
+  fi
+  if ! save_managed_service_ports; then
+    MANAGED_PORTS=("${previous[@]}")
+    error "保存端口清单失败。"
+    return 1
+  fi
+  if (( was_rule == 0 )) && ! log_command quiet ufw allow "$rule" comment "vps-manager managed port"; then
+    MANAGED_PORTS=("${previous[@]}")
+    save_managed_service_ports >/dev/null 2>&1 || true
+    error "添加 UFW 规则失败，已恢复端口清单。"
+    return 1
+  fi
+  ok "已开放 ${rule}。"
+  ufw_is_active || info "当前是宽松模式；规则已保存，将在启用 UFW 后生效。"
+  log_line "firewall port opened: ${rule}"
+  show_port_details "$rule"
+}
+
+close_managed_port() {
+  local rule ssh_rule was_rule=0 was_managed=0
+  local -a previous=()
+  require_root
+  require_ubuntu || return 1
+  ensure_ufw || return 1
+  rule="$(prompt_port_rule)" || return 1
+  ssh_rule="$(current_ssh_port)/tcp"
+  if [[ "$rule" == "$ssh_rule" ]]; then
+    error "拒绝关闭当前 SSH 端口 ${ssh_rule}。请先在 SSH 菜单中修改并验证新端口。"
+    return 1
+  fi
+  load_managed_service_ports
+  previous=("${MANAGED_PORTS[@]}")
+  managed_port_exists "$rule" && was_managed=1
+  ufw_rule_exists "$rule" && was_rule=1
+  printf '\n'
+  show_port_details "$rule"
+  if (( was_managed == 0 && was_rule == 0 )); then
+    info "${rule} 当前不在允许清单中。"
+    return 0
+  fi
+  warn "关闭端口只修改防火墙，不会停止正在监听的服务。"
+  confirm "确认关闭 ${rule}？" || return 0
+  remove_managed_port "$rule"
+  if ! save_managed_service_ports; then
+    MANAGED_PORTS=("${previous[@]}")
+    error "保存端口清单失败。"
+    return 1
+  fi
+  if (( was_rule )) && ! log_command quiet ufw --force delete allow "$rule"; then
+    MANAGED_PORTS=("${previous[@]}")
+    save_managed_service_ports >/dev/null 2>&1 || true
+    error "删除 UFW 规则失败，已恢复端口清单。"
+    return 1
+  fi
+  ok "已关闭 ${rule}。"
+  log_line "firewall port closed: ${rule}"
+  show_port_details "$rule"
 }
 
 restore_ufw_backup() {
@@ -494,6 +670,10 @@ set_firewall_tight() {
   warn "将清空现有 UFW 规则并按以上清单重建；云厂商安全组仍需单独配置。"
   confirm "确认切换到收紧模式？" || return 0
   acquire_lock || return 1
+  if [[ ! -f "$PORT_CONFIG_FILE" ]] && ! save_managed_service_ports; then
+    error "无法保存收紧模式端口清单。"
+    return 1
+  fi
 
   ufw_is_active && was_active=1
   backup_dir="${BACKUP_ROOT}/ufw-$(date '+%Y%m%d-%H%M%S').$$"
@@ -535,11 +715,15 @@ firewall_menu() {
     show_firewall_status
     printf '\n  1. 宽松模式（关闭 UFW）\n'
     printf '  2. 收紧模式（只允许 SSH 和服务端口）\n'
+    printf '  3. 开启端口\n'
+    printf '  4. 关闭端口\n'
     printf '  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
       1) set_firewall_relaxed; pause ;;
       2) set_firewall_tight; pause ;;
+      3) open_managed_port; pause ;;
+      4) close_managed_port; pause ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac

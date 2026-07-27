@@ -1,6 +1,6 @@
 # mb-linux / vps-manager
 
-`vps-manager 1.2.4` 是一个面向 Ubuntu VPS 的中文管理脚本，用菜单完成系统初始化、SSH、防火墙、BBR、Swap、Docker、DNS 和日常维护。
+`vps-manager 1.3.0` 是一个面向 Ubuntu VPS 的中文管理脚本，用菜单完成系统初始化、SSH、防火墙、BBR、Swap、Docker、DNS 和日常维护。
 
 > 仅支持 Ubuntu。修改 SSH、防火墙或网络前，请保留当前 SSH 会话，并确保可以使用云厂商控制台救援。
 
@@ -74,12 +74,20 @@ sudo vps-manager
 
 ## 防火墙模式
 
-菜单 `5` 只保留两种模式：
+菜单 `5` 提供四项操作：
 
-- **宽松模式**：关闭 UFW，主机不再过滤入站端口；云安全组仍可能限制访问。
-- **收紧模式**：备份并重建 UFW，只允许当前 SSH 端口及 `80/443/8443/2087` 服务端口，拒绝其他入站和转发。
+```text
+1. 宽松模式（关闭 UFW）
+2. 收紧模式（只允许 SSH 和服务端口）
+3. 开启端口
+4. 关闭端口
+```
 
-收紧模式会最先放行当前 SSH 端口，应用前还会显示完整端口清单并要求确认。Docker 映射到公网的端口可能绕过 UFW，不需要的容器端口不要发布。
+- **宽松模式**：关闭 UFW，主机不再过滤入站端口；现有规则仍会保留。
+- **收紧模式**：备份并重建 UFW，最先放行当前 SSH，再按端口清单放行服务，拒绝其他入站和转发。
+- **开启/关闭端口**：输入 `8080`、`8080/tcp` 或 `53/udp`，脚本会显示防火墙状态和监听服务，再请求确认。
+
+端口清单保存在 `/etc/vps-manager/ports.conf`。关闭的默认端口不会被收紧模式重新打开，自定义端口也不会丢失。当前 SSH 端口不能从端口菜单关闭。Docker 映射到公网的端口可能绕过 UFW，不需要的容器端口不要发布。
 
 ## AI 与流媒体检测
 
@@ -120,7 +128,7 @@ sudo lm update
 sudo lm                 # 打开菜单
 sudo lm init            # 基础初始化向导
 sudo lm status          # 查看系统状态
-sudo lm ports           # 选择防火墙模式
+sudo lm ports           # 管理防火墙模式和端口
 sudo lm swap            # Swap 管理
 sudo lm security        # Fail2ban 与自动安全更新
 sudo lm docker          # Docker 管理
