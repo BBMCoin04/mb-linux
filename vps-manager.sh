@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
@@ -38,13 +38,6 @@ COMMON_PACKAGES=(
   vim
   wget
 )
-SELF_PATH="${BASH_SOURCE[0]}"
-if [[ -f "$SELF_PATH" ]]; then
-  SELF_PATH="$(readlink -f "$SELF_PATH" 2>/dev/null || printf '%s' "$SELF_PATH")"
-else
-  SELF_PATH=""
-fi
-
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RED=$'\033[31m'
   C_GREEN=$'\033[32m'
@@ -94,6 +87,28 @@ require_root() {
 ensure_directories() {
   install -d -m 0700 "$LOG_ROOT"
   install -d -m 0755 "$(dirname "$LOCK_FILE")"
+}
+
+atomic_install_file() {
+  local source="$1" target="$2" mode="$3" temporary
+  temporary="$(mktemp "$(dirname "$target")/.$(basename "$target").XXXXXX")" || return 1
+  if ! install -m "$mode" "$source" "$temporary" || ! mv -f -- "$temporary" "$target"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+validate_manager_paths() {
+  [[ "$INSTALL_PATH" == /* && "$INSTALL_PATH" != *[[:space:]]* ]] || {
+    error "管理器安装路径必须是不含空白的绝对路径。"
+    return 1
+  }
+  if [[ -n "$ALIAS_PATH" ]]; then
+    [[ "$ALIAS_PATH" == /* && "$ALIAS_PATH" != *[[:space:]]* && "$ALIAS_PATH" != "$INSTALL_PATH" ]] || {
+      error "快捷命令路径必须是不含空白且不同于安装路径的绝对路径。"
+      return 1
+    }
+  fi
 }
 
 acquire_lock() {
@@ -154,9 +169,12 @@ ensure_command() {
 
 backup_file() {
   local file="$1" backup
-  [[ -e "$file" ]] || return 0
-  backup="${file}.bak.$(date '+%Y%m%d-%H%M%S')"
-  cp -a "$file" "$backup"
+  [[ -e "$file" || -L "$file" ]] || return 0
+  backup="${file}.bak.$(date '+%Y%m%d-%H%M%S').$$"
+  if ! cp -a -- "$file" "$backup"; then
+    error "无法备份 ${file}。"
+    return 1
+  fi
   ok "已备份 ${file} -> ${backup}"
 }
 
@@ -203,8 +221,8 @@ ${PROGRAM} ${VERSION}
   ${PROGRAM} hostname     设置主机名
   ${PROGRAM} check-ai     执行内置 AI 连通性检测
   ${PROGRAM} check-media  选择并运行第三方流媒体检测
+  ${PROGRAM} cleanup-system  执行带确认的保守系统清理
   ${PROGRAM} update       从 GitHub 更新 vps-manager
-  ${PROGRAM} install      安装或修复固定副本
   ${PROGRAM} version
 
 日志文件：${LOG_FILE}
@@ -287,12 +305,18 @@ set_hostname() {
   [[ "$new_hostname" != "$old_hostname" ]] || { info "主机名已经是 ${new_hostname}。"; return 0; }
   printf '准备修改：%s -> %s\n' "$old_hostname" "$new_hostname"
   confirm "确认修改主机名？" || return 0
-  backup_file "$hosts_file"
+  backup_file "$hosts_file" || return 1
   hostnamectl set-hostname "$new_hostname" || return 1
   if grep -qE '^127\.0\.1\.1[[:space:]]+' "$hosts_file"; then
-    sed -i -E "s/^127\.0\.1\.1[[:space:]]+.*/127.0.1.1 ${new_hostname}/" "$hosts_file"
-  else
-    printf '\n127.0.1.1 %s\n' "$new_hostname" >> "$hosts_file"
+    if ! sed -i -E "s/^127\.0\.1\.1[[:space:]]+.*/127.0.1.1 ${new_hostname}/" "$hosts_file"; then
+      hostnamectl set-hostname "$old_hostname" || true
+      error "更新 ${hosts_file} 失败，已尝试恢复原主机名。"
+      return 1
+    fi
+  elif ! printf '\n127.0.1.1 %s\n' "$new_hostname" >> "$hosts_file"; then
+    hostnamectl set-hostname "$old_hostname" || true
+    error "更新 ${hosts_file} 失败，已尝试恢复原主机名。"
+    return 1
   fi
   ok "主机名已设置为 ${new_hostname}；新 SSH 会话会显示新名称。"
   log_line "hostname changed from ${old_hostname} to ${new_hostname}"
@@ -457,18 +481,30 @@ bbr_status() {
 enable_bbr() {
   require_root
   require_ubuntu || return 1
-  local available
+  local available temporary backup=""
   modprobe tcp_bbr 2>/dev/null || true
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
   if [[ "$available" != *bbr* ]]; then
     error "当前内核未提供 BBR，无法启用。"
     return 1
   fi
-  cat > /etc/sysctl.d/99-vps-manager-bbr.conf <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
+  temporary="$(mktemp /tmp/vps-manager-bbr.XXXXXX)" || return 1
+  if [[ -f /etc/sysctl.d/99-vps-manager-bbr.conf ]]; then
+    backup="$(mktemp /tmp/vps-manager-bbr-original.XXXXXX)" || { rm -f -- "$temporary"; return 1; }
+    cp -a -- /etc/sysctl.d/99-vps-manager-bbr.conf "$backup" || { rm -f -- "$temporary" "$backup"; return 1; }
+  fi
+  {
+    printf 'net.core.default_qdisc=fq\n'
+    printf 'net.ipv4.tcp_congestion_control=bbr\n'
+  } > "$temporary"
+  if ! atomic_install_file "$temporary" /etc/sysctl.d/99-vps-manager-bbr.conf 0644; then
+    rm -f -- "$temporary" "$backup"
+    error "无法写入 BBR 配置。"
+    return 1
+  fi
+  rm -f -- "$temporary"
   if log_command interactive sysctl --system; then
+    rm -f -- "$backup"
     ok "BBR 配置已写入 /etc/sysctl.d/99-vps-manager-bbr.conf"
     bbr_status
     if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
@@ -478,18 +514,35 @@ EOF
       offer_reboot "BBR 配置已写入，但系统同时标记为需要重启。"
     fi
   else
-    error "应用 sysctl 配置失败。"
+    if [[ -n "$backup" ]]; then
+      atomic_install_file "$backup" /etc/sysctl.d/99-vps-manager-bbr.conf 0644 || true
+    else
+      rm -f -- /etc/sysctl.d/99-vps-manager-bbr.conf
+    fi
+    rm -f -- "$backup"
+    log_command quiet sysctl --system || true
+    error "应用 sysctl 配置失败，已恢复原配置。"
     return 1
   fi
 }
 
 disable_bbr() {
+  local backup
   require_root
   [[ -f /etc/sysctl.d/99-vps-manager-bbr.conf ]] || { info "vps-manager 没有创建 BBR 配置。"; return 0; }
   warn "只会删除 vps-manager 创建的 BBR sysctl 文件。"
   confirm "确认移除 BBR 配置？" || return 0
-  rm -f /etc/sysctl.d/99-vps-manager-bbr.conf
-  log_command quiet sysctl --system || true
+  backup="$(mktemp /tmp/vps-manager-bbr-original.XXXXXX)" || return 1
+  cp -a -- /etc/sysctl.d/99-vps-manager-bbr.conf "$backup" || { rm -f -- "$backup"; return 1; }
+  rm -f -- /etc/sysctl.d/99-vps-manager-bbr.conf
+  if ! log_command quiet sysctl --system; then
+    atomic_install_file "$backup" /etc/sysctl.d/99-vps-manager-bbr.conf 0644 || true
+    rm -f -- "$backup"
+    log_command quiet sysctl --system || true
+    error "重新加载 sysctl 失败，已恢复 BBR 配置。"
+    return 1
+  fi
+  rm -f -- "$backup"
   ok "已移除 vps-manager 的 BBR 配置，系统已重新加载现有 sysctl。"
 }
 
@@ -531,7 +584,7 @@ show_swap_status() {
 }
 
 create_swap() {
-  local size_gb available_kb required_kb target_dir
+  local size_gb available_kb required_kb target_dir temp_fstab temp_sysctl
   require_root
   require_ubuntu || return 1
   ensure_command mkswap util-linux || return 1
@@ -571,30 +624,74 @@ create_swap() {
     return 1
   fi
   if ! awk -v file="$SWAP_FILE" '$1==file && $3=="swap" {found=1} END {exit !found}' /etc/fstab; then
-    printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> /etc/fstab
+    temp_fstab="$(mktemp /tmp/vps-manager-fstab.XXXXXX)" || {
+      swapoff "$SWAP_FILE" 2>/dev/null || true
+      rm -f -- "$SWAP_FILE"
+      return 1
+    }
+    if ! cp -a -- /etc/fstab "$temp_fstab" ||
+       ! printf '%s none swap sw 0 0\n' "$SWAP_FILE" >> "$temp_fstab" ||
+       ! atomic_install_file "$temp_fstab" /etc/fstab 0644; then
+      rm -f -- "$temp_fstab"
+      swapoff "$SWAP_FILE" 2>/dev/null || true
+      rm -f -- "$SWAP_FILE"
+      error "写入 /etc/fstab 失败，已撤销新 Swap。"
+      return 1
+    fi
+    rm -f -- "$temp_fstab"
   fi
-  printf 'vm.swappiness=10\n' > "$SWAP_SYSCTL_FILE"
-  chmod 0644 "$SWAP_SYSCTL_FILE"
-  sysctl -p "$SWAP_SYSCTL_FILE" >/dev/null 2>&1 || true
+  temp_sysctl="$(mktemp /tmp/vps-manager-swap-sysctl.XXXXXX)" || return 1
+  printf 'vm.swappiness=10\n' > "$temp_sysctl"
+  if ! atomic_install_file "$temp_sysctl" "$SWAP_SYSCTL_FILE" 0644; then
+    rm -f -- "$temp_sysctl"
+    warn "Swap 已启用，但无法写入 swappiness 持久配置。"
+    return 1
+  fi
+  rm -f -- "$temp_sysctl"
+  sysctl -p "$SWAP_SYSCTL_FILE" >/dev/null 2>&1 || warn "Swap 已启用，但 vm.swappiness 未能立即应用。"
   ok "Swap 已创建并启用。"
   log_line "swap created: ${SWAP_FILE} ${size_gb}GiB"
   show_swap_status
 }
 
 delete_swap() {
-  local temp_fstab
+  local temp_fstab original_fstab was_active=0
   require_root
   [[ -e "$SWAP_FILE" ]] || { info "未发现 vps-manager 默认 Swap 文件：${SWAP_FILE}"; return 0; }
   warn "将停用并删除 ${SWAP_FILE}，释放其占用的磁盘空间。"
   show_swap_status
   confirm "确认删除该 Swap？" || return 0
   if swapon --noheadings --show=NAME 2>/dev/null | grep -Fxq "$SWAP_FILE"; then
+    was_active=1
     swapoff "$SWAP_FILE" || { error "无法停用 Swap，已停止删除。"; return 1; }
   fi
-  temp_fstab="$(mktemp /tmp/vps-manager-fstab.XXXXXX)" || return 1
-  awk -v file="$SWAP_FILE" '$1 != file' /etc/fstab > "$temp_fstab"
-  install -m 0644 "$temp_fstab" /etc/fstab
-  rm -f "$temp_fstab" "$SWAP_FILE" "$SWAP_SYSCTL_FILE"
+  temp_fstab="$(mktemp /tmp/vps-manager-fstab.XXXXXX)" || {
+    (( was_active == 0 )) || swapon "$SWAP_FILE" 2>/dev/null || true
+    return 1
+  }
+  original_fstab="$(mktemp /tmp/vps-manager-fstab-original.XXXXXX)" || {
+    rm -f -- "$temp_fstab"
+    (( was_active == 0 )) || swapon "$SWAP_FILE" 2>/dev/null || true
+    return 1
+  }
+  if ! cp -a -- /etc/fstab "$original_fstab" ||
+     ! awk -v file="$SWAP_FILE" '$1 != file' /etc/fstab > "$temp_fstab" ||
+     ! atomic_install_file "$temp_fstab" /etc/fstab 0644; then
+    rm -f -- "$temp_fstab" "$original_fstab"
+    (( was_active == 0 )) || swapon "$SWAP_FILE" 2>/dev/null || true
+    error "更新 /etc/fstab 失败，未删除 Swap 文件。"
+    return 1
+  fi
+  rm -f -- "$temp_fstab"
+  if ! rm -f -- "$SWAP_FILE"; then
+    atomic_install_file "$original_fstab" /etc/fstab 0644 || true
+    (( was_active == 0 )) || swapon "$SWAP_FILE" 2>/dev/null || true
+    rm -f -- "$original_fstab"
+    error "无法删除 ${SWAP_FILE}，已尝试恢复 /etc/fstab 和 Swap 状态。"
+    return 1
+  fi
+  rm -f -- "$original_fstab"
+  rm -f -- "$SWAP_SYSCTL_FILE"
   ok "${SWAP_FILE} 已删除。"
   log_line "swap deleted: ${SWAP_FILE}"
   show_swap_status
@@ -643,7 +740,7 @@ set_resolved_key() {
 }
 
 apply_dns_servers() {
-  local label="$1" dns="$2" fallback="$3" resolved_file="/etc/systemd/resolved.conf"
+  local label="$1" dns="$2" fallback="$3" resolved_file="/etc/systemd/resolved.conf" rollback
   require_root
   require_ubuntu || return 1
   printf 'DNS 方案：%s\n' "$label"
@@ -651,25 +748,42 @@ apply_dns_servers() {
   confirm "确认修改 DNS 配置？" || return 0
 
   if command -v systemctl >/dev/null 2>&1 && [[ -f "$resolved_file" ]]; then
-    backup_file "$resolved_file"
-    set_resolved_key "$resolved_file" DNS "$dns"
-    set_resolved_key "$resolved_file" FallbackDNS "$fallback"
-    if systemctl restart systemd-resolved; then
+    rollback="$(mktemp /tmp/vps-manager-resolved.XXXXXX)" || return 1
+    cp -a -- "$resolved_file" "$rollback" || { rm -f -- "$rollback"; return 1; }
+    backup_file "$resolved_file" || { rm -f -- "$rollback"; return 1; }
+    if set_resolved_key "$resolved_file" DNS "$dns" &&
+       set_resolved_key "$resolved_file" FallbackDNS "$fallback" &&
+       systemctl restart systemd-resolved; then
+      rm -f -- "$rollback"
       ok "systemd-resolved DNS 已更新。"
       show_dns_status
       return 0
     fi
-    error "重启 systemd-resolved 失败。"
+    cp -a -- "$rollback" "$resolved_file" || true
+    rm -f -- "$rollback"
+    systemctl restart systemd-resolved >/dev/null 2>&1 || true
+    error "DNS 配置应用失败，已恢复原配置。"
     return 1
   fi
 
-  backup_file /etc/resolv.conf
-  {
+  rollback="$(mktemp /tmp/vps-manager-resolv.XXXXXX)" || return 1
+  if ! cp -L -- /etc/resolv.conf "$rollback"; then
+    rm -f -- "$rollback"
+    return 1
+  fi
+  backup_file /etc/resolv.conf || { rm -f -- "$rollback"; return 1; }
+  if ! {
     printf '# Managed by vps-manager on %s\n' "$(date '+%F %T %z')"
     for server in $dns $fallback; do
       printf 'nameserver %s\n' "$server"
     done
-  } > /etc/resolv.conf
+  } > /etc/resolv.conf; then
+    cat "$rollback" > /etc/resolv.conf || true
+    rm -f -- "$rollback"
+    error "写入 /etc/resolv.conf 失败，已尝试恢复原内容。"
+    return 1
+  fi
+  rm -f -- "$rollback"
   ok "/etc/resolv.conf 已更新。"
   show_dns_status
 }
@@ -776,13 +890,17 @@ apply_sshd_option() {
   install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")"
   if [[ -f "$SSHD_MANAGED_FILE" ]]; then
     had_file=1
-    backup="${SSHD_MANAGED_FILE}.bak.$(date '+%Y%m%d-%H%M%S')"
-    cp -a "$SSHD_MANAGED_FILE" "$backup"
-  else
-    : > "$SSHD_MANAGED_FILE"
+    backup="${SSHD_MANAGED_FILE}.bak.$(date '+%Y%m%d-%H%M%S').$$"
+    cp -a -- "$SSHD_MANAGED_FILE" "$backup" || { error "无法备份 SSH 管理配置。"; return 1; }
+  elif ! : > "$SSHD_MANAGED_FILE"; then
+    error "无法创建 SSH 管理配置。"
+    return 1
   fi
-  set_sshd_option_in_file "$SSHD_MANAGED_FILE" "$option" "$value"
-  chmod 0644 "$SSHD_MANAGED_FILE"
+  if ! set_sshd_option_in_file "$SSHD_MANAGED_FILE" "$option" "$value" || ! chmod 0644 "$SSHD_MANAGED_FILE"; then
+    if (( had_file )); then cp -a -- "$backup" "$SSHD_MANAGED_FILE"; else rm -f -- "$SSHD_MANAGED_FILE"; fi
+    error "写入 SSH 管理配置失败，已恢复。"
+    return 1
+  fi
 
   if "$sshd" -t -f "$config"; then
     key="${option,,}"
@@ -802,9 +920,9 @@ apply_sshd_option() {
   fi
 
   if (( had_file )); then
-    cp -a "$backup" "$SSHD_MANAGED_FILE"
+    cp -a -- "$backup" "$SSHD_MANAGED_FILE"
   else
-    rm -f "$SSHD_MANAGED_FILE"
+    rm -f -- "$SSHD_MANAGED_FILE"
   fi
   reload_ssh_service || true
   return 1
@@ -891,16 +1009,23 @@ show_fail2ban_status() {
 }
 
 sync_fail2ban_ssh_port() {
-  local port="$1"
+  local port="$1" backup
   [[ -f "$FAIL2BAN_JAIL_FILE" ]] || return 0
-  sed -i -E "s/^port[[:space:]]*=.*/port = ${port}/" "$FAIL2BAN_JAIL_FILE"
-  if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client -t >/dev/null 2>&1; then
-    systemctl restart fail2ban >/dev/null 2>&1 || true
+  backup="$(mktemp /tmp/vps-manager-fail2ban.XXXXXX)" || return 1
+  cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { rm -f -- "$backup"; return 1; }
+  if sed -i -E "s/^port[[:space:]]*=.*/port = ${port}/" "$FAIL2BAN_JAIL_FILE" &&
+     command -v fail2ban-client >/dev/null 2>&1 &&
+     fail2ban-client -t >/dev/null 2>&1 &&
+     systemctl restart fail2ban >/dev/null 2>&1; then
+    rm -f -- "$backup"
     ok "Fail2ban SSH jail 已同步到端口 ${port}。"
-  else
-    warn "Fail2ban 端口已写入，但配置测试或重启失败，请检查 ${FAIL2BAN_JAIL_FILE}。"
-    return 1
+    return 0
   fi
+  cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE" || true
+  rm -f -- "$backup"
+  systemctl restart fail2ban >/dev/null 2>&1 || true
+  warn "Fail2ban 端口同步失败，已恢复原配置。"
+  return 1
 }
 
 enable_fail2ban() {
@@ -914,8 +1039,8 @@ enable_fail2ban() {
   log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || return 1
   install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")"
   if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
-    backup="${FAIL2BAN_JAIL_FILE}.bak.$(date '+%Y%m%d-%H%M%S')"
-    cp -a "$FAIL2BAN_JAIL_FILE" "$backup"
+    backup="${FAIL2BAN_JAIL_FILE}.bak.$(date '+%Y%m%d-%H%M%S').$$"
+    cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { error "无法备份现有 Fail2ban 配置。"; return 1; }
   fi
   {
     printf '[sshd]\n'
@@ -928,26 +1053,39 @@ enable_fail2ban() {
   } > "$FAIL2BAN_JAIL_FILE"
   chmod 0644 "$FAIL2BAN_JAIL_FILE"
   if ! fail2ban-client -t; then
-    if [[ -n "$backup" ]]; then cp -a "$backup" "$FAIL2BAN_JAIL_FILE"; else rm -f "$FAIL2BAN_JAIL_FILE"; fi
+    if [[ -n "$backup" ]]; then cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE"; else rm -f -- "$FAIL2BAN_JAIL_FILE"; fi
     error "Fail2ban 配置测试失败，已恢复。"
     return 1
   fi
-  systemctl enable --now fail2ban >/dev/null 2>&1 || true
-  systemctl restart fail2ban || { error "Fail2ban 启动失败。"; return 1; }
+  systemctl enable fail2ban >/dev/null 2>&1 || warn "Fail2ban 开机启动设置失败，请稍后检查。"
+  if ! systemctl restart fail2ban; then
+    if [[ -n "$backup" ]]; then cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE"; else rm -f -- "$FAIL2BAN_JAIL_FILE"; fi
+    systemctl restart fail2ban >/dev/null 2>&1 || true
+    error "Fail2ban 启动失败，已恢复原配置。"
+    return 1
+  fi
   ok "Fail2ban SSH 防护已启用：5 次失败/10 分钟，封禁 1 小时。"
   log_line "fail2ban sshd enabled on port ${port}"
   show_fail2ban_status
 }
 
 disable_fail2ban() {
+  local backup
   require_root
   [[ -f "$FAIL2BAN_JAIL_FILE" ]] || { info "未发现 vps-manager 管理的 Fail2ban SSH jail。"; return 0; }
   warn "只会移除 vps-manager 的 SSH jail，不卸载 Fail2ban，也不删除其他 jail。"
   confirm "确认关闭该 SSH jail？" || return 0
-  rm -f "$FAIL2BAN_JAIL_FILE"
-  if command -v fail2ban-client >/dev/null 2>&1; then
+  backup="$(mktemp /tmp/vps-manager-fail2ban.XXXXXX)" || return 1
+  cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { rm -f -- "$backup"; return 1; }
+  rm -f -- "$FAIL2BAN_JAIL_FILE"
+  if command -v fail2ban-client >/dev/null 2>&1 && ! systemctl restart fail2ban; then
+    cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE" || true
     systemctl restart fail2ban >/dev/null 2>&1 || true
+    rm -f -- "$backup"
+    error "Fail2ban 重启失败，已恢复 SSH jail。"
+    return 1
   fi
+  rm -f -- "$backup"
   ok "vps-manager 的 Fail2ban SSH jail 已移除。"
 }
 
@@ -972,7 +1110,8 @@ enable_auto_updates() {
   confirm "确认安装并启用自动安全更新？" || return 0
   log_command interactive apt-get update || return 1
   log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades || return 1
-  backup_file "$AUTO_UPGRADES_FILE"
+  backup_file "$AUTO_UPGRADES_FILE" || return 1
+  backup_file "$AUTO_UPGRADES_OPTIONS_FILE" || return 1
   {
     printf 'APT::Periodic::Update-Package-Lists "1";\n'
     printf 'APT::Periodic::Unattended-Upgrade "1";\n'
@@ -1084,8 +1223,13 @@ run_remote_script() {
     return 1
   fi
   if [[ ! -s "$temp_file" ]]; then
-    rm -f "$temp_file"
+    rm -f -- "$temp_file"
     error "下载结果为空，拒绝执行。"
+    return 1
+  fi
+  if ! bash -n "$temp_file"; then
+    rm -f -- "$temp_file"
+    error "下载的第三方脚本未通过 Bash 语法检查，拒绝执行。"
     return 1
   fi
   log_command interactive bash "$temp_file" "$@"
@@ -1161,14 +1305,17 @@ install_docker_official() {
       conflicts+=("$package")
     fi
   done
+  info "准备配置 Docker 官方 Ubuntu 仓库：${codename}/${architecture}。"
   if (( ${#conflicts[@]} > 0 )); then
     warn "检测到与 Docker CE 官方包冲突的软件包：${conflicts[*]}"
-    warn "移除软件包不会自动删除 /var/lib/docker，但仍可能影响现有容器服务。"
-    confirm "确认移除这些冲突包？" || return 0
+    warn "继续安装前必须移除这些包；不会自动删除 /var/lib/docker，但现有容器服务可能中断。"
+  fi
+  confirm "确认开始安装或更新 Docker Engine？" || return 0
+  acquire_lock || return 1
+  if (( ${#conflicts[@]} > 0 )); then
+    confirm "再次确认移除冲突包并继续安装 Docker？" || return 0
     log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get remove -y "${conflicts[@]}" || return 1
   fi
-  info "准备配置 Docker 官方 Ubuntu 仓库：${codename}/${architecture}。"
-  confirm "确认安装或更新 Docker Engine？" || return 0
   log_command interactive apt-get update || return 1
   log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl || return 1
   install -d -m 0755 /etc/apt/keyrings
@@ -1275,6 +1422,68 @@ show_log() {
   fi
 }
 
+trim_manager_log_if_large() {
+  local size temporary
+  [[ -f "$LOG_FILE" ]] || return 0
+  size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf '0')"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  (( size > 5 * 1024 * 1024 )) || return 0
+  temporary="$(mktemp "${LOG_ROOT}/.vps-manager-log.XXXXXX")" || return 1
+  if ! tail -n 2000 "$LOG_FILE" > "$temporary" || ! atomic_install_file "$temporary" "$LOG_FILE" 0600; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
+  ok "管理器日志超过 5 MiB，已保留最近 2000 行。"
+}
+
+safe_system_cleanup() {
+  local before_kb after_kb freed_kb actions=0 failures=0
+  require_root
+  require_ubuntu || return 1
+  printf '\n%s保守系统清理范围%s\n' "$C_BOLD" "$C_RESET"
+  printf '  - 清理 APT 下载缓存（不卸载软件）\n'
+  printf '  - 按 systemd-tmpfiles 系统策略清理过期临时文件\n'
+  printf '  - 清理 14 天以前的 systemd journal 归档\n'
+  printf '  - vps-manager.log 超过 5 MiB 时保留最近 2000 行\n'
+  printf '明确不会执行：autoremove、Docker prune、证书/密钥删除、用户目录扫描、防火墙清空。\n'
+  confirm "确认执行以上保守清理？" || return 0
+  acquire_lock || return 1
+
+  before_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $3}' || printf '0')"
+  if command -v apt-get >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    apt-get clean || failures=$((failures + 1))
+  else
+    info "未找到 apt-get，跳过软件包缓存。"
+  fi
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    systemd-tmpfiles --clean || failures=$((failures + 1))
+  fi
+  if command -v journalctl >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    journalctl --vacuum-time=14d || failures=$((failures + 1))
+  fi
+  actions=$((actions + 1))
+  trim_manager_log_if_large || failures=$((failures + 1))
+
+  after_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $3}' || printf '0')"
+  if [[ "$before_kb" =~ ^[0-9]+$ && "$after_kb" =~ ^[0-9]+$ && "$before_kb" -ge "$after_kb" ]]; then
+    freed_kb=$((before_kb - after_kb))
+  else
+    freed_kb=0
+  fi
+  if (( failures == 0 )); then
+    ok "保守系统清理完成，共执行 ${actions} 项，约释放 $((freed_kb / 1024)) MiB。"
+    log_line "safe system cleanup completed: actions=${actions} freed_mib=$((freed_kb / 1024))"
+  else
+    warn "保守系统清理完成，但 ${failures}/${actions} 项失败；未执行激进删除。"
+    log_line "safe system cleanup completed with failures: ${failures}/${actions}"
+    return 1
+  fi
+}
+
 system_menu() {
   local choice timezone
   require_root
@@ -1348,41 +1557,10 @@ init_wizard() {
   ok "基础初始化向导已结束。"
 }
 
-install_alias() {
-  [[ -n "$ALIAS_PATH" ]] || return 0
-  [[ "$ALIAS_PATH" == "$INSTALL_PATH" ]] && return 0
-  install -d -m 0755 "$(dirname "$ALIAS_PATH")" || return 1
-  if [[ -e "$ALIAS_PATH" || -L "$ALIAS_PATH" ]]; then
-    if [[ "$(readlink -f "$ALIAS_PATH" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
-      warn "${ALIAS_PATH} 已被其他文件占用，跳过快捷命令配置。"
-    fi
-    return 0
-  fi
-  if ln -s "$INSTALL_PATH" "$ALIAS_PATH"; then
-    ok "快捷命令已配置：sudo $(basename "$ALIAS_PATH")"
-  else
-    warn "快捷命令配置失败：${ALIAS_PATH}"
-  fi
-}
-
-install_manager_binary() {
-  require_root
-  install -d -m 0755 "$(dirname "$INSTALL_PATH")" || return 1
-  if [[ "$SELF_PATH" == "$INSTALL_PATH" ]]; then
-    chmod 0755 "$INSTALL_PATH" || return 1
-  elif [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
-    install -m 0755 "$SELF_PATH" "$INSTALL_PATH" || return 1
-  else
-    error "当前脚本来自临时数据流，无法安装固定副本。请使用 install.sh 引导安装器。"
-    return 1
-  fi
-  install_alias
-  ok "vps-manager 已安装到 ${INSTALL_PATH}"
-}
-
 update_manager() {
   local timestamp installer installer_url source_url rc backup="" new_version=""
   require_root
+  validate_manager_paths || return 1
   ensure_command curl curl || return 1
 
   timestamp="$(date +%s)"
@@ -1390,8 +1568,8 @@ update_manager() {
   source_url="${MANAGER_RAW_BASE}/vps-manager.sh?ts=${timestamp}"
   installer="$(mktemp /tmp/vps-manager-bootstrap.XXXXXX.sh)" || return 1
   if [[ -f "$INSTALL_PATH" ]]; then
-    backup="$(mktemp /tmp/vps-manager-current.XXXXXX.sh)" || { rm -f "$installer"; return 1; }
-    cp -a "$INSTALL_PATH" "$backup"
+    backup="$(mktemp /tmp/vps-manager-current.XXXXXX.sh)" || { rm -f -- "$installer"; return 1; }
+    cp -a -- "$INSTALL_PATH" "$backup" || { rm -f -- "$installer" "$backup"; return 1; }
   fi
 
   info "正在检查 ${MANAGER_REPO}@${MANAGER_REF} 的管理器版本..."
@@ -1416,46 +1594,27 @@ update_manager() {
   rm -f "$installer"
 
   if (( rc != 0 )); then
-    [[ -n "$backup" && -s "$backup" ]] && install -m 0755 "$backup" "$INSTALL_PATH"
-    rm -f "$backup"
+    if [[ -n "$backup" && -s "$backup" ]]; then
+      install -m 0755 "$backup" "$INSTALL_PATH" || true
+    fi
+    rm -f -- "$backup"
     error "vps-manager 更新失败。"
     return "$rc"
   fi
   new_version="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}')"
-  if [[ -z "$new_version" || "$(printf '%s\n' "$VERSION" "$new_version" | sort -V | head -n 1)" != "$VERSION" ]]; then
-    [[ -n "$backup" && -s "$backup" ]] && install -m 0755 "$backup" "$INSTALL_PATH"
-    rm -f "$backup"
+  if [[ ! "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+     [[ "$(printf '%s\n' "$VERSION" "$new_version" | sort -V | head -n 1)" != "$VERSION" ]]; then
+    if [[ -n "$backup" && -s "$backup" ]]; then
+      install -m 0755 "$backup" "$INSTALL_PATH" || true
+    else
+      rm -f -- "$INSTALL_PATH"
+    fi
+    rm -f -- "$backup"
     error "远程版本 ${new_version:-未知} 低于或无法验证当前版本 ${VERSION}，已拒绝降级并恢复。"
     return 1
   fi
   rm -f "$backup"
   ok "vps-manager 更新完成：${VERSION} -> ${new_version}"
-}
-
-advanced_menu() {
-  local choice
-  require_root
-  while true; do
-    printf '\n高级维护：\n'
-    printf '  1. 安装/修复 vps-manager 固定副本\n'
-    printf '  2. 更新 vps-manager\n'
-    printf '  3. 查看最近日志\n'
-    printf '  0. 返回\n'
-    read -r -p "请选择：" choice
-    case "$choice" in
-      1) install_manager_binary; pause ;;
-      2)
-        if update_manager; then
-          info "正在重新载入最新版菜单..."
-          exec "$INSTALL_PATH"
-        fi
-        pause
-        ;;
-      3) show_log; pause ;;
-      0) return 0 ;;
-      *) error "无效选项。"; pause ;;
-    esac
-  done
 }
 
 main_menu() {
@@ -1481,7 +1640,8 @@ main_menu() {
     printf '  9. DNS 配置\n'
     printf ' 10. AI/流媒体解锁检测\n'
     printf ' 11. 系统状态与最近日志\n'
-    printf ' 12. 高级维护\n'
+    printf ' 12. 保守系统清理\n'
+    printf ' 13. 更新 vps-manager\n'
     printf '  0. 退出\n'
     read -r -p "请选择：" choice
     printf '\n'
@@ -1497,7 +1657,14 @@ main_menu() {
       9) dns_menu ;;
       10) check_media_menu ;;
       11) show_status; printf '\n最近日志：\n'; show_log; pause ;;
-      12) advanced_menu ;;
+      12) safe_system_cleanup; pause ;;
+      13)
+        if update_manager; then
+          info "正在重新载入最新版菜单..."
+          exec "$INSTALL_PATH"
+        fi
+        pause
+        ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -1518,8 +1685,8 @@ main() {
     hostname) shift; set_hostname "${1:-}" ;;
     check-ai) check_ai_connectivity ;;
     check-media) check_media_menu ;;
+    cleanup-system) safe_system_cleanup ;;
     update|update-manager) update_manager ;;
-    install) install_manager_binary ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|--help|-h) show_help ;;
     *) error "未知命令：${subcommand}"; show_help; return 2 ;;

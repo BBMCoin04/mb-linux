@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 DEFAULT_REPO="BBMCoin04/mb-linux"
 REPO="${VPS_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${VPS_MANAGER_REF:-main}"
@@ -17,6 +17,8 @@ if [[ -z "${VPS_MANAGER_SOURCE_URL+x}" && -n "$SCRIPT_DIR" && -s "${SCRIPT_DIR}/
   BUNDLED_SOURCE="${SCRIPT_DIR}/vps-manager.sh"
 fi
 TEMP_FILE=""
+BACKUP_FILE=""
+ALIAS_CREATED=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RED=$'\033[31m'
@@ -35,12 +37,30 @@ ok() { printf '%s[完成]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 error() { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 
 cleanup() {
-  [[ -n "$TEMP_FILE" ]] && rm -f "$TEMP_FILE"
+  [[ -z "$TEMP_FILE" ]] || rm -f -- "$TEMP_FILE"
+  [[ -z "$BACKUP_FILE" ]] || rm -f -- "$BACKUP_FILE"
 }
 trap cleanup EXIT HUP INT TERM
 
+restore_manager() {
+  if [[ -n "$BACKUP_FILE" && -s "$BACKUP_FILE" ]]; then
+    install -m 0755 "$BACKUP_FILE" "$INSTALL_PATH" || true
+  else
+    rm -f -- "$INSTALL_PATH"
+  fi
+  (( ALIAS_CREATED == 0 )) || rm -f -- "$ALIAS_PATH"
+}
+
 if (( EUID != 0 )); then
   error "安装需要 root 权限，请在命令前使用 sudo。"
+  exit 1
+fi
+if [[ "$INSTALL_PATH" != /* || "$INSTALL_PATH" == *[[:space:]]* ]]; then
+  error "管理器安装路径必须是不含空白的绝对路径。"
+  exit 1
+fi
+if [[ -n "$ALIAS_PATH" && ( "$ALIAS_PATH" != /* || "$ALIAS_PATH" == *[[:space:]]* || "$ALIAS_PATH" == "$INSTALL_PATH" ) ]]; then
+  error "快捷命令路径必须是不含空白且不同于安装路径的绝对路径。"
   exit 1
 fi
 
@@ -93,31 +113,64 @@ if ! grep -q '^PROGRAM="vps-manager"$' "$TEMP_FILE"; then
   error "下载内容不是预期的 vps-manager 主程序，拒绝安装。"
   exit 1
 fi
+MANAGER_VERSION="$(awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' "$TEMP_FILE")"
+if [[ ! "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  error "无法识别管理器版本，拒绝安装。"
+  exit 1
+fi
+if [[ -x "$INSTALL_PATH" ]]; then
+  EXISTING_VERSION="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
+  if [[ "$EXISTING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+     [[ "$(printf '%s\n' "$EXISTING_VERSION" "$MANAGER_VERSION" | sort -V | head -n 1)" != "$EXISTING_VERSION" ]]; then
+    error "拒绝用 ${MANAGER_VERSION} 覆盖已安装的新版本 ${EXISTING_VERSION}。"
+    exit 1
+  fi
+fi
 
 install -d -m 0755 "$(dirname "$INSTALL_PATH")" || {
   error "无法创建管理器安装目录。"
   exit 1
 }
-install -m 0755 "$TEMP_FILE" "$INSTALL_PATH" || {
-  error "无法安装管理器到 ${INSTALL_PATH}。"
-  exit 1
-}
-if [[ -n "$ALIAS_PATH" && "$ALIAS_PATH" != "$INSTALL_PATH" ]]; then
-  install -d -m 0755 "$(dirname "$ALIAS_PATH")"
-  if [[ -e "$ALIAS_PATH" || -L "$ALIAS_PATH" ]]; then
-    if [[ "$(readlink -f "$ALIAS_PATH" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
-      info "${ALIAS_PATH} 已被其他文件占用，跳过快捷命令配置。"
-    fi
-  elif ln -s "$INSTALL_PATH" "$ALIAS_PATH"; then
-    ok "快捷命令已配置：sudo $(basename "$ALIAS_PATH")"
+[[ ! -L "$INSTALL_PATH" ]] || { error "安装目标不能是软链接：${INSTALL_PATH}"; exit 1; }
+[[ ! -e "$INSTALL_PATH" || -f "$INSTALL_PATH" ]] || { error "安装目标必须是普通文件路径：${INSTALL_PATH}"; exit 1; }
+if [[ -n "$ALIAS_PATH" ]]; then
+  install -d -m 0755 "$(dirname "$ALIAS_PATH")" || exit 1
+  if [[ ( -e "$ALIAS_PATH" || -L "$ALIAS_PATH" ) && "$(readlink -f "$ALIAS_PATH" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
+    error "快捷命令路径已被其他程序占用，不会覆盖：${ALIAS_PATH}"
+    exit 1
   fi
 fi
+if [[ -f "$INSTALL_PATH" ]]; then
+  BACKUP_FILE="$(mktemp /tmp/vps-manager-existing.XXXXXX.sh)" || exit 1
+  cp -a -- "$INSTALL_PATH" "$BACKUP_FILE" || exit 1
+fi
+if ! install -m 0755 "$TEMP_FILE" "$INSTALL_PATH"; then
+  restore_manager
+  error "管理器安装失败，已尝试恢复原版本。"
+  exit 1
+fi
+if [[ -n "$ALIAS_PATH" && ! -e "$ALIAS_PATH" && ! -L "$ALIAS_PATH" ]]; then
+  if ! ln -s "$INSTALL_PATH" "$ALIAS_PATH"; then
+    restore_manager
+    error "无法创建快捷命令 ${ALIAS_PATH}。"
+    exit 1
+  fi
+  ALIAS_CREATED=1
+  ok "快捷命令已配置：sudo $(basename "$ALIAS_PATH")"
+fi
+if [[ "$("$INSTALL_PATH" version 2>/dev/null)" != "vps-manager ${MANAGER_VERSION}" ]]; then
+  restore_manager
+  error "安装后的版本自检失败，已恢复原版本。"
+  exit 1
+fi
+
 hash_value="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || true)"
-ok "vps-manager 已安装到 ${INSTALL_PATH}"
+ok "vps-manager ${MANAGER_VERSION} 已安装到 ${INSTALL_PATH}"
 [[ -n "$hash_value" ]] && printf 'SHA-256: %s\n' "$hash_value"
 
 cleanup
 TEMP_FILE=""
+BACKUP_FILE=""
 trap - EXIT HUP INT TERM
 
 if (( $# > 0 )); then

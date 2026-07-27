@@ -1,6 +1,6 @@
 # mb-linux / vps-manager
 
-`vps-manager 1.1.0` 是面向 Ubuntu VPS 的交互式初始化与日常维护工具，适合新机器开通后统一处理：
+`vps-manager 1.2.0` 是面向 Ubuntu VPS 的交互式初始化与日常维护工具，适合新机器开通后统一处理：
 
 - 完整系统升级与重启提示
 - 主机名、时区和常用依赖
@@ -13,6 +13,7 @@
 - Docker 官方 Ubuntu 仓库安装
 - DNS
 - AI/流媒体网络检测
+- 带确认的保守系统清理
 
 所有关键修改都显示影响并请求确认。脚本不会自动关闭 SSH、防火墙或删除 Docker 数据。
 
@@ -62,7 +63,8 @@ sudo vps-manager
 9.  DNS 配置
 10. AI/流媒体解锁检测
 11. 系统状态与最近日志
-12. 高级维护
+12. 保守系统清理
+13. 更新 vps-manager
 0.  退出
 ```
 
@@ -214,6 +216,17 @@ Fail2ban 只能降低在线暴力破解风险，不能替代强密码、公钥�
 
 关闭时不卸载软件包，只关闭周期配置并删除脚本附加选项。
 
+## 保守系统清理
+
+主菜单 `12` 或命令 `sudo vps-manager cleanup-system` 会先展示完整范围并要求确认，只执行：
+
+- `apt-get clean` 清理 APT 下载缓存，不卸载软件。
+- `systemd-tmpfiles --clean` 按系统策略清理过期临时文件。
+- `journalctl --vacuum-time=14d` 清理 14 天以前的 journal 归档。
+- 管理器日志超过 5 MiB 时保留最近 2000 行。
+
+不会执行 `autoremove`、Docker prune、证书或密钥删除、用户目录扫描、防火墙清空或手工批量删除。命令会统计根分区执行前后的占用差值；如果日志或缓存位于其他挂载点，显示的释放量可能低于实际值。
+
 ## Docker
 
 Docker 安装严格使用官方 Ubuntu apt 流程：
@@ -269,8 +282,8 @@ sudo vps-manager docker
 sudo vps-manager hostname my-vps-01
 sudo vps-manager check-ai
 sudo vps-manager check-media
+sudo vps-manager cleanup-system
 sudo vps-manager update
-sudo vps-manager install
 vps-manager version
 vps-manager help
 ```
@@ -283,7 +296,7 @@ vps-manager help
 
 ## 更新与回归
 
-管理器更新会下载并检查安装器和主程序标识、Bash 语法及版本。远程版本低于当前版本时自动恢复，拒绝意外降级。
+主菜单 `13` 或命令 `sudo vps-manager update` 可直接更新管理器，成功后自动重新载入新版菜单。安装器和管理器更新都会检查主程序标识、Bash 语法及语义化版本；安装目标不允许是软链接，快捷命令不会覆盖其他程序，安装或自检失败时恢复原版本，远程版本低于已安装版本时拒绝覆盖。需要重新安装或修复命令入口时，重新运行 `install.sh`。
 
 开发行为测试：
 
@@ -291,7 +304,7 @@ vps-manager help
 ./tests/behavior.sh
 ```
 
-测试覆盖端口解析、默认端口数量、子菜单返回、帮助和版本。实际系统修改应继续在新 Ubuntu VPS 上验证，因为沙箱不能模拟 systemd、UFW、sshd、Swap 和 Docker daemon 的完整行为。
+现有测试覆盖端口解析、默认端口数量、子菜单返回、帮助和版本。实际系统修改应继续在新 Ubuntu VPS 上验证，因为沙箱不能模拟 systemd、UFW、sshd、Swap、Fail2ban 和 Docker daemon 的完整行为。
 
 ## 支持范围
 
