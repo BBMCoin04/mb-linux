@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
@@ -1717,7 +1717,8 @@ main_menu() {
       12) safe_system_cleanup; pause ;;
       13)
         if update_manager; then
-          info "正在重新载入最新版菜单..."
+          info "更新结果已显示。按 Enter 重新载入最新版菜单。"
+          pause
           exec "$INSTALL_PATH"
         fi
         pause
