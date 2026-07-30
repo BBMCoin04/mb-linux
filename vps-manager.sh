@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.4.2"
+VERSION="1.4.3"
 PROGRAM="vps-manager"
 SUPPORTED_UBUNTU_CODENAMES=(jammy noble questing resolute)
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
@@ -16,6 +16,7 @@ LOG_ROOT="${LOG_ROOT:-/var/log/vps-manager}"
 LOG_FILE="${LOG_ROOT}/vps-manager.log"
 BACKUP_ROOT="${VPS_MANAGER_BACKUP_ROOT:-/var/backups/vps-manager}"
 LOCK_FILE="/run/lock/vps-manager.lock"
+LOCK_HELD=0
 DEFAULT_TIMEZONE="${DEFAULT_TIMEZONE:-Asia/Shanghai}"
 DEFAULT_PORTS="${DEFAULT_PORTS:-22/tcp,80/tcp,443/tcp,443/udp,8443/tcp,8443/udp,2087/tcp}"
 CONFIG_ROOT="${VPS_MANAGER_CONFIG_ROOT:-/etc/vps-manager}"
@@ -122,12 +123,15 @@ validate_manager_paths() {
 }
 
 acquire_lock() {
+  (( LOCK_HELD == 0 )) || return 0
   ensure_directories
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    warn "另一个 vps-manager 任务正在运行，本次操作退出。"
+    exec 9>&-
+    warn "另一个 vps-manager 修改任务正在运行，本次操作退出。"
     return 1
   fi
+  LOCK_HELD=1
 }
 
 log_line() {
@@ -373,6 +377,7 @@ set_hostname() {
   [[ "$new_hostname" != "$old_hostname" ]] || { info "主机名已经是 ${new_hostname}。"; return 0; }
   printf '准备修改：%s -> %s\n' "$old_hostname" "$new_hostname"
   confirm "确认修改主机名？" || return 0
+  acquire_lock || return 1
   backup_file "$hosts_file" || return 1
   hosts_candidate="$(mktemp /tmp/vps-manager-hosts.XXXXXX)" || return 1
   cp -a -- "$hosts_file" "$hosts_candidate" || { rm -f -- "$hosts_candidate"; return 1; }
@@ -409,6 +414,7 @@ set_timezone() {
   local timezone="${1:-$DEFAULT_TIMEZONE}"
   require_root
   require_ubuntu || return 1
+  acquire_lock || return 1
   ensure_command timedatectl systemd || return 1
   info "当前时区：$(timedatectl show -p Timezone --value 2>/dev/null || printf '未知')"
   if timedatectl set-timezone "$timezone"; then
@@ -634,6 +640,7 @@ open_managed_port() {
     return 0
   fi
   confirm "确认开放 ${rule}？" || return 0
+  acquire_lock || return 1
   if (( is_ssh_rule == 0 )) && ! managed_port_exists "$rule"; then
     MANAGED_PORTS+=("$rule")
   fi
@@ -683,6 +690,7 @@ close_managed_port() {
   fi
   warn "关闭端口只修改防火墙，不会停止正在监听的服务。"
   confirm "确认关闭 ${rule}？" || return 0
+  acquire_lock || return 1
   remove_managed_port "$rule"
   if ! save_managed_service_ports; then
     MANAGED_PORTS=("${previous[@]}")
@@ -726,6 +734,7 @@ set_firewall_relaxed() {
   fi
   warn "宽松模式会关闭 UFW，主机不再过滤入站端口；云厂商安全组仍可能限制访问。"
   confirm "确认切换到宽松模式？" || return 0
+  acquire_lock || return 1
   if log_command quiet ufw disable; then
     ok "已切换到宽松模式：UFW 已关闭，现有规则保留。"
     log_line "firewall mode changed to relaxed"
@@ -846,6 +855,7 @@ bbr_status() {
 enable_bbr() {
   require_root
   require_ubuntu || return 1
+  acquire_lock || return 1
   local available temporary backup=""
   modprobe tcp_bbr 2>/dev/null || true
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
@@ -897,6 +907,7 @@ disable_bbr() {
   [[ -f /etc/sysctl.d/99-vps-manager-bbr.conf ]] || { info "vps-manager 没有创建 BBR 配置。"; return 0; }
   warn "只会删除 vps-manager 创建的 BBR sysctl 文件。"
   confirm "确认移除 BBR 配置？" || return 0
+  acquire_lock || return 1
   backup="$(mktemp /tmp/vps-manager-bbr-original.XXXXXX)" || return 1
   cp -a -- /etc/sysctl.d/99-vps-manager-bbr.conf "$backup" || { rm -f -- "$backup"; return 1; }
   rm -f -- /etc/sysctl.d/99-vps-manager-bbr.conf
@@ -979,7 +990,7 @@ save_swap_state() {
 }
 
 create_swap() {
-  local size_gb available_kb required_kb target_dir temp_fstab temp_sysctl
+  local size_gb available_kb required_kb target_dir temp_fstab temp_sysctl="" fstab_added=0
   require_root
   require_ubuntu || return 1
   validate_swap_path || return 1
@@ -989,6 +1000,7 @@ create_swap() {
     if ! swap_is_managed; then
       warn "该 Swap 没有 vps-manager 管理标记，脚本不会直接删除它。"
       if confirm "是否将现有 ${SWAP_FILE} 纳入 vps-manager 管理？"; then
+        acquire_lock || return 1
         save_swap_state || { error "无法保存 Swap 管理状态。"; return 1; }
         ok "已记录 Swap 管理状态。"
       fi
@@ -1016,6 +1028,7 @@ create_swap() {
   fi
   printf '准备创建 %s GiB Swap：%s\n' "$size_gb" "$SWAP_FILE"
   confirm "确认创建并设置开机启用？" || return 0
+  acquire_lock || return 1
   backup_file /etc/fstab || return 1
   if ! fallocate -l "${size_gb}G" "$SWAP_FILE" 2>/dev/null; then
     warn "fallocate 不可用，改用 dd 创建，可能需要一些时间。"
@@ -1048,20 +1061,32 @@ create_swap() {
       return 1
     fi
     rm -f -- "$temp_fstab"
+    fstab_added=1
   fi
-  temp_sysctl="$(mktemp /tmp/vps-manager-swap-sysctl.XXXXXX)" || return 1
-  printf 'vm.swappiness=10\n' > "$temp_sysctl"
-  if ! atomic_install_file "$temp_sysctl" "$SWAP_SYSCTL_FILE" 0644; then
-    rm -f -- "$temp_sysctl"
-    warn "Swap 已启用，但无法写入 swappiness 持久配置。"
-    return 1
-  fi
-  rm -f -- "$temp_sysctl"
-  sysctl -p "$SWAP_SYSCTL_FILE" >/dev/null 2>&1 || warn "Swap 已启用，但 vm.swappiness 未能立即应用。"
   if ! save_swap_state; then
-    warn "Swap 已启用，但管理状态保存失败；脚本将拒绝自动删除该文件。"
+    swapoff "$SWAP_FILE" 2>/dev/null || true
+    rm -f -- "$SWAP_FILE" "$SWAP_STATE_FILE"
+    if (( fstab_added )); then
+      temp_fstab="$(mktemp /tmp/vps-manager-fstab.XXXXXX)" || temp_fstab=""
+      if [[ -z "$temp_fstab" ]] ||
+         ! awk -v file="$SWAP_FILE" '$1 != file' /etc/fstab > "$temp_fstab" ||
+         ! atomic_install_file "$temp_fstab" /etc/fstab 0644; then
+        error "Swap 管理状态写入失败，且 /etc/fstab 自动恢复不完整，请检查备份。"
+      fi
+      [[ -z "$temp_fstab" ]] || rm -f -- "$temp_fstab"
+    fi
+    error "Swap 管理状态写入失败，已尝试撤销本次 Swap 创建。"
     return 1
   fi
+  temp_sysctl="$(mktemp /tmp/vps-manager-swap-sysctl.XXXXXX)" || temp_sysctl=""
+  if [[ -n "$temp_sysctl" ]] &&
+     printf 'vm.swappiness=10\n' > "$temp_sysctl" &&
+     atomic_install_file "$temp_sysctl" "$SWAP_SYSCTL_FILE" 0644; then
+    sysctl -p "$SWAP_SYSCTL_FILE" >/dev/null 2>&1 || warn "Swap 已启用，但 vm.swappiness 未能立即应用。"
+  else
+    warn "Swap 已启用并受管理，但无法写入 swappiness 持久配置。"
+  fi
+  [[ -z "$temp_sysctl" ]] || rm -f -- "$temp_sysctl"
   ok "Swap 已创建并启用。"
   log_line "swap created: ${SWAP_FILE} ${size_gb}GiB"
   show_swap_status
@@ -1080,6 +1105,7 @@ delete_swap() {
   warn "将停用并删除 ${SWAP_FILE}，释放其占用的磁盘空间。"
   show_swap_status
   confirm "确认删除该 Swap？" || return 0
+  acquire_lock || return 1
   backup_file /etc/fstab || return 1
   if swapon --noheadings --show=NAME 2>/dev/null | grep -Fxq "$SWAP_FILE"; then
     was_active=1
@@ -1261,6 +1287,7 @@ apply_dns_servers() {
     warn "检测到 cloud-init 或 netplan；其网络配置可能在重启后覆盖系统 DNS，请重启后复查。"
   fi
   confirm "确认修改 DNS 配置？" || return 0
+  acquire_lock || return 1
 
   if systemd_resolved_manages_dns; then
     rollback="$(mktemp /tmp/vps-manager-resolved-old.XXXXXX)" || return 1
@@ -1439,7 +1466,7 @@ reload_ssh_service() {
 }
 
 apply_sshd_options() {
-  local config backup="" sshd option value key effective index valid=1 had_file=0
+  local config backup="" sshd option value key effective index valid=1 had_file=0 restore_failed=0
   local -a settings=("$@")
   (( ${#settings[@]} > 0 && ${#settings[@]} % 2 == 0 )) || return 1
   require_root
@@ -1455,6 +1482,7 @@ apply_sshd_options() {
     printf '  %s %s\n' "${settings[$index]}" "${settings[$((index + 1))]}"
   done
   confirm "确认修改 SSH 配置？" || return 2
+  acquire_lock || return 1
   install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")"
   if [[ -f "$SSHD_MANAGED_FILE" ]]; then
     had_file=1
@@ -1518,11 +1546,15 @@ apply_sshd_options() {
 
   warn "SSH 修改未能完整生效，正在恢复。"
   if (( had_file )); then
-    cp -a -- "$backup" "$SSHD_MANAGED_FILE"
+    cp -a -- "$backup" "$SSHD_MANAGED_FILE" || restore_failed=1
   else
-    rm -f -- "$SSHD_MANAGED_FILE"
+    rm -f -- "$SSHD_MANAGED_FILE" || restore_failed=1
   fi
-  reload_ssh_service || true
+  if (( restore_failed == 0 )) && "$sshd" -t -f "$config" && reload_ssh_service; then
+    warn "SSH 原配置已恢复。"
+  else
+    error "SSH 原配置恢复或重载失败，请保持当前会话并使用控制台检查。"
+  fi
   return 1
 }
 
@@ -1557,6 +1589,7 @@ apply_ssh_ports() {
   printf '\n准备保留并监听以下 SSH TCP 端口：\n'
   printf '  %s/tcp\n' "${unique[@]}"
   confirm "确认修改 SSH 监听端口？" || return 2
+  acquire_lock || return 1
 
   install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")" || return 1
   install -d -m 0700 "$BACKUP_ROOT" || return 1
@@ -1641,6 +1674,7 @@ change_ssh_port() {
   fi
   warn "请先在 VPS 控制台安全组中放行 ${port}/tcp，并保持当前 SSH 会话。"
   confirm "确认安全组已放行并继续？" || return 0
+  acquire_lock || return 1
   if ufw_is_active && ! ufw_rule_exists "${port}/tcp"; then
     info "检测到 UFW 已启用，先放行新的 SSH TCP ${port}。"
     log_command interactive ufw allow "${port}/tcp" comment "SSH added by vps-manager" || return 1
@@ -1665,8 +1699,21 @@ change_ssh_port() {
   return 1
 }
 
+default_authorized_keys_enabled() {
+  local sshd_output path
+  sshd_output="$("$(sshd_bin)" -T 2>/dev/null || true)"
+  [[ "$(awk '$1=="pubkeyauthentication" {print $2; exit}' <<< "$sshd_output")" == "yes" ]] || return 1
+  while IFS= read -r path; do
+    case "$path" in
+      .ssh/authorized_keys|%h/.ssh/authorized_keys) return 0 ;;
+    esac
+  done < <(awk '$1=="authorizedkeysfile" {for (i=2; i<=NF; i++) print $i}' <<< "$sshd_output")
+  return 1
+}
+
 authorized_keys_present() {
   local file user shell permit_root="no"
+  default_authorized_keys_enabled || return 1
   permit_root="$("$(sshd_bin)" -T 2>/dev/null | awk '$1=="permitrootlogin" {print $2; exit}')"
   if [[ -s /root/.ssh/authorized_keys && "$permit_root" != "no" ]]; then
     return 0
@@ -1686,7 +1733,7 @@ authorized_keys_present() {
 
 disable_password_login() {
   if ! authorized_keys_present; then
-    error "未发现允许登录账户的有效 authorized_keys，拒绝关闭密码登录，以免锁定 SSH。"
+    error "未检测到已启用的默认公钥登录配置和候选 authorized_keys，拒绝关闭密码登录。"
     return 1
   fi
   warn "关闭密码登录前，请保持当前会话，并另开窗口验证公钥登录。"
@@ -1698,6 +1745,7 @@ disable_password_login() {
 
 sudo_authorized_key_present() {
   local file user shell
+  default_authorized_keys_enabled || return 1
   for file in /home/*/.ssh/authorized_keys; do
     [[ -s "$file" ]] || continue
     user="${file#/home/}"
@@ -1713,7 +1761,7 @@ sudo_authorized_key_present() {
 
 disable_root_login() {
   if ! sudo_authorized_key_present; then
-    error "未发现同时具备 sudo 权限和 authorized_keys 的普通用户，拒绝关闭 root 登录。"
+    error "未检测到已启用默认公钥登录且具备 sudo 权限的普通用户，拒绝关闭 root 登录。"
     return 1
   fi
   warn "请先用该 sudo 用户在新窗口验证 SSH 登录，再关闭 root 登录。"
@@ -1801,6 +1849,12 @@ fail2ban_sshd_rule_matches() {
     [[ "$(fail2ban-client get sshd bantime 2>/dev/null || true)" == "3600" ]]
 }
 
+fail2ban_managed_ports_match() {
+  local expected="$1" configured
+  configured="$(awk -F= '/^[[:space:]]*port[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$FAIL2BAN_JAIL_FILE" 2>/dev/null)"
+  [[ "$configured" == "$expected" ]]
+}
+
 sync_fail2ban_ssh_ports() {
   local ports backup
   [[ -f "$FAIL2BAN_JAIL_FILE" ]] || return 0
@@ -1808,7 +1862,8 @@ sync_fail2ban_ssh_ports() {
   [[ -n "$ports" ]] || return 1
   backup="$(mktemp /tmp/vps-manager-fail2ban.XXXXXX)" || return 1
   cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { rm -f -- "$backup"; return 1; }
-  if sed -i -E "s/^port[[:space:]]*=.*/port = ${ports}/" "$FAIL2BAN_JAIL_FILE" &&
+  if sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port = ${ports}/" "$FAIL2BAN_JAIL_FILE" &&
+     fail2ban_managed_ports_match "$ports" &&
      command -v fail2ban-client >/dev/null 2>&1 &&
      fail2ban-client -t >/dev/null 2>&1 &&
      systemctl restart fail2ban >/dev/null 2>&1 &&
@@ -1891,6 +1946,7 @@ disable_fail2ban() {
   [[ -f "$FAIL2BAN_JAIL_FILE" ]] || { info "未发现 vps-manager 管理的 Fail2ban SSH jail。"; return 0; }
   warn "只会移除 vps-manager 的 SSH jail，不卸载 Fail2ban，也不删除其他 jail。"
   confirm "确认关闭该 SSH jail？" || return 0
+  acquire_lock || return 1
   backup="$(mktemp /tmp/vps-manager-fail2ban.XXXXXX)" || return 1
   cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { rm -f -- "$backup"; return 1; }
   rm -f -- "$FAIL2BAN_JAIL_FILE"
@@ -1935,10 +1991,10 @@ restore_file_snapshot() {
 
 enable_auto_updates() {
   local periodic_tmp options_tmp periodic_snapshot options_snapshot apt_dump
-  local had_periodic=0 had_options=0 failed=0
+  local had_periodic=0 had_options=0 failed=0 timer_attempted=0
   require_root
   require_ubuntu || return 1
-  info "只启用 Ubuntu unattended-upgrades 的安全更新；不会自动重启。"
+  info "将启用 unattended-upgrades 周期执行，沿用系统现有允许来源；不会自动重启。"
   confirm "确认安装并启用自动安全更新？" || return 0
   acquire_lock || return 1
   relocate_legacy_apt_backups || { error "迁移旧版 APT 备份失败，已停止配置。"; return 1; }
@@ -1972,8 +2028,9 @@ enable_auto_updates() {
     grep -q 'APT::Periodic::Unattended-Upgrade "1";' <<< "$apt_dump" || failed=1
     grep -q 'Unattended-Upgrade::Automatic-Reboot "false";' <<< "$apt_dump" || failed=1
   fi
-  if (( failed == 0 )) && ! systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1; then
-    failed=1
+  if (( failed == 0 )); then
+    timer_attempted=1
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || failed=1
   fi
 
   rm -f -- "$periodic_tmp" "$options_tmp"
@@ -1981,11 +2038,12 @@ enable_auto_updates() {
     restore_file_snapshot "$periodic_snapshot" "$had_periodic" "$AUTO_UPGRADES_FILE" || true
     restore_file_snapshot "$options_snapshot" "$had_options" "$AUTO_UPGRADES_OPTIONS_FILE" || true
     rm -f -- "$periodic_snapshot" "$options_snapshot"
-    error "自动安全更新配置未通过验证，已恢复原配置。"
+    (( timer_attempted == 0 )) || warn "APT timer 可能部分启用，请检查 systemctl 状态。"
+    error "自动更新配置未通过验证，已恢复原配置文件。"
     return 1
   fi
   rm -f -- "$periodic_snapshot" "$options_snapshot"
-  ok "自动安全更新已启用并通过配置与 timer 检查，自动重启保持关闭。"
+  ok "自动更新已启用并通过配置与 timer 检查，自动重启保持关闭。"
   log_line "unattended-upgrades enabled without automatic reboot"
   show_auto_updates_status
 }
@@ -1997,6 +2055,7 @@ disable_auto_updates() {
   require_ubuntu || return 1
   warn "不会卸载 unattended-upgrades，只会关闭周期执行并删除脚本管理的附加选项。"
   confirm "确认关闭自动安全更新？" || return 0
+  acquire_lock || return 1
   periodic_tmp="$(mktemp /tmp/vps-manager-auto-periodic.XXXXXX)" || return 1
   periodic_snapshot="$(mktemp /tmp/vps-manager-auto-periodic-old.XXXXXX)" || { rm -f -- "$periodic_tmp"; return 1; }
   options_snapshot="$(mktemp /tmp/vps-manager-auto-options-old.XXXXXX)" || { rm -f -- "$periodic_tmp" "$periodic_snapshot"; return 1; }
@@ -2322,6 +2381,7 @@ add_user_to_docker_group() {
   id "$username" >/dev/null 2>&1 || { error "用户不存在：${username}"; return 1; }
   warn "docker 组成员可以控制 Docker daemon，权限实际等同 root。"
   confirm "确认将 ${username} 加入 docker 组？" || return 0
+  acquire_lock || return 1
   groupadd -f docker
   usermod -aG docker "$username"
   ok "${username} 已加入 docker 组；需要重新登录后生效。"
@@ -2540,6 +2600,7 @@ update_manager() {
   local timestamp installer installer_url source_url rc backup="" new_version=""
   require_root
   validate_manager_paths || return 1
+  acquire_lock || return 1
   ensure_command curl curl || return 1
 
   timestamp="$(date +%s)"

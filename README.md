@@ -1,6 +1,6 @@
 # mb-linux / vps-manager
 
-`vps-manager 1.4.2` 是面向个人 Ubuntu VPS 的中文交互式基础环境管理脚本，提供系统升级、SSH、UFW、Fail2ban、自动安全更新、BBR、Swap、Docker、DNS、状态检查和保守清理。
+`vps-manager 1.4.3` 是面向个人 Ubuntu VPS 的中文交互式基础环境管理脚本，提供系统升级、SSH、UFW、Fail2ban、自动安全更新、BBR、Swap、Docker、DNS、状态检查和保守清理。
 
 ## 支持范围
 
@@ -63,7 +63,7 @@ lm version              # 查看版本
 - 配置需通过 `sshd -t`、有效值检查、服务重载和实际监听检查。
 - Ubuntu 24.04/26.04 的 `ssh.socket` 会执行 `daemon-reload` 并重启 socket。
 - 脚本不会自动删除旧 SSH 端口。请先用新窗口验证，再手动清理不再需要的端口和云安全组规则。
-- 关闭 root 登录前，必须检测到具有 `sudo` 权限和 `authorized_keys` 的普通用户。
+- 关闭密码或 root 登录前，会检查默认公钥登录已启用并存在候选 `authorized_keys`；用户仍须先用新窗口完成真实登录验证。
 
 ### UFW
 
@@ -85,7 +85,7 @@ lm version              # 查看版本
 
 ### Swap
 
-- 默认创建 `/swapfile`，并记录管理状态。
+- 默认创建 `/swapfile`，并记录管理状态；状态写入失败时撤销本次创建。
 - 只有带有匹配管理状态的 Swap 才允许从菜单删除。
 - 升级前已经存在的 Swap 不会被自动接管；可在创建 Swap 菜单中明确确认接管。
 
@@ -98,7 +98,7 @@ lm version              # 查看版本
 ### Docker
 
 - 使用 Docker 官方 Ubuntu 仓库，支持 `jammy`、`noble`、`questing` 和 `resolute`。
-- 如果系统已有唯一且有效的 `docker.list` 或 `docker.sources`，会原样复用，不创建重复源；检测到多个官方源时拒绝继续并提示检查。
+- 如果系统在其他路径已有唯一有效的 Docker 官方源，会原样复用；默认 `docker.sources` 路径会先备份再规范化写入。检测到多个官方源文件时拒绝继续。
 - 没有现有官方源时，先创建并验证新源；随后预下载 Docker CE 安装包，再请求移除冲突包。
 - 检测到已安装 Docker 组件存在版本更新时，显示版本清单并提示容器可能短暂中断；用户再次确认后才安装。
 - 不会自动删除 `/var/lib/docker`。
@@ -106,8 +106,8 @@ lm version              # 查看版本
 
 ### 自动安全更新
 
-- 使用 Ubuntu `unattended-upgrades`，自动重启保持关闭。
-- 写入后验证 APT 生效值和 systemd timer；验证失败恢复原配置并报告失败。
+- 使用 Ubuntu `unattended-upgrades`，沿用系统现有允许来源，自动重启保持关闭。
+- 写入后验证 APT 生效值和 systemd timer；验证失败恢复配置文件并报告 timer 状态可能需要检查。
 
 ## 更新行为
 

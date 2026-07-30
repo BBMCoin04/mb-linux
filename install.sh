@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.4.2"
+VERSION="1.4.3"
 DEFAULT_REPO="BBMCoin04/mb-linux"
 REPO="${VPS_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${VPS_MANAGER_REF:-main}"
