@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 PROGRAM="vps-manager"
 SUPPORTED_UBUNTU_CODENAMES=(jammy noble questing resolute)
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
@@ -31,8 +31,9 @@ RESOLV_CONF_FILE="${VPS_MANAGER_RESOLV_CONF_FILE:-/etc/resolv.conf}"
 APT_CONFIG_DIR="${VPS_MANAGER_APT_CONFIG_DIR:-/etc/apt/apt.conf.d}"
 AUTO_UPGRADES_FILE="${VPS_MANAGER_AUTO_UPGRADES_FILE:-${APT_CONFIG_DIR}/20auto-upgrades}"
 AUTO_UPGRADES_OPTIONS_FILE="${VPS_MANAGER_AUTO_UPGRADES_OPTIONS_FILE:-${APT_CONFIG_DIR}/52vps-manager-unattended-upgrades}"
-DOCKER_KEY_FILE="/etc/apt/keyrings/docker.asc"
-DOCKER_SOURCE_FILE="/etc/apt/sources.list.d/docker.sources"
+APT_SOURCE_ROOT="${VPS_MANAGER_APT_SOURCE_ROOT:-/etc/apt}"
+DOCKER_KEY_FILE="${VPS_MANAGER_DOCKER_KEY_FILE:-${APT_SOURCE_ROOT}/keyrings/docker.asc}"
+DOCKER_SOURCE_FILE="${VPS_MANAGER_DOCKER_SOURCE_FILE:-${APT_SOURCE_ROOT}/sources.list.d/docker.sources}"
 COMMON_PACKAGES=(
   ca-certificates
   curl
@@ -2098,8 +2099,29 @@ show_docker_status() {
     printf 'Docker 服务：%s\n' "${active:-未运行}"
     printf '开机启动：%s\n' "${enabled:-未启用}"
   fi
-  [[ -f "$DOCKER_SOURCE_FILE" ]] && { printf '\nDocker 官方源：\n'; sed -n '1,80p' "$DOCKER_SOURCE_FILE"; }
+  printf '\nDocker 官方源：\n'
+  local source_file found_source=0
+  while IFS= read -r source_file; do
+    found_source=1
+    printf '  %s\n' "$source_file"
+    sed -n '1,20p' "$source_file"
+  done < <(find_docker_official_sources)
+  (( found_source )) || printf '  未检测到\n'
 }
+
+find_docker_official_sources() (
+  local source_file
+  local -a candidates=("${APT_SOURCE_ROOT}/sources.list")
+  shopt -s nullglob
+  candidates+=("${APT_SOURCE_ROOT}"/sources.list.d/*.list "${APT_SOURCE_ROOT}"/sources.list.d/*.sources)
+  shopt -u nullglob
+  for source_file in "${candidates[@]}"; do
+    [[ -f "$source_file" ]] || continue
+    if grep -Eq '^[[:space:]]*(deb([^[:alnum:]]|$)|URIs:).*https://download\.docker\.com/linux/ubuntu([[:space:]]|$)' "$source_file" 2>/dev/null; then
+      printf '%s\n' "$source_file"
+    fi
+  done
+)
 
 restore_docker_repo_state() {
   local key_snapshot="$1" had_key="$2" source_snapshot="$3" had_source="$4"
@@ -2110,9 +2132,10 @@ restore_docker_repo_state() {
 }
 
 install_docker_official() {
-  local codename architecture package key_candidate source_candidate key_snapshot source_snapshot rc=0
-  local had_key=0 had_source=0 repo_ready=0
-  local -a conflicts=() conflict_packages=(docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)
+  local codename architecture package key_candidate="" source_candidate="" key_snapshot="" source_snapshot="" rc=0
+  local existing_source="" had_key=0 had_source=0 repo_ready=0 reuse_existing=0
+  local -a conflicts=() official_sources=()
+  local -a conflict_packages=(docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)
   local -a docker_packages=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
   require_root
   require_ubuntu || return 1
@@ -2135,79 +2158,105 @@ install_docker_official() {
       conflicts+=("$package")
     fi
   done
-  info "准备配置 Docker 官方 Ubuntu 仓库：${codename}/${architecture}。"
+  info "准备验证 Docker 官方 Ubuntu 仓库：${codename}/${architecture}。"
   if (( ${#conflicts[@]} > 0 )); then
     warn "检测到与 Docker CE 官方包冲突的软件包：${conflicts[*]}"
     warn "仓库和安装包验证完成后才会请求移除；不会自动删除 /var/lib/docker。"
   fi
   confirm "确认开始准备 Docker Engine 安装或更新？" || return 0
   acquire_lock || return 1
+
+  mapfile -t official_sources < <(find_docker_official_sources)
+  if (( ${#official_sources[@]} > 1 )); then
+    error "检测到多个 Docker 官方仓库定义，拒绝继续以避免 Signed-By 冲突："
+    printf '  %s\n' "${official_sources[@]}" >&2
+    return 1
+  fi
+  if (( ${#official_sources[@]} == 1 )); then
+    existing_source="${official_sources[0]}"
+  fi
+
   log_command interactive apt-get update || return 1
   log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl || return 1
-  install -d -m 0755 /etc/apt/keyrings || return 1
-  install -d -m 0755 "$(dirname "$DOCKER_SOURCE_FILE")" || return 1
 
-  key_candidate="$(mktemp /tmp/vps-manager-docker-key.XXXXXX)" || return 1
-  source_candidate="$(mktemp /tmp/vps-manager-docker-source.XXXXXX)" || { rm -f -- "$key_candidate"; return 1; }
-  key_snapshot="$(mktemp /tmp/vps-manager-docker-key-old.XXXXXX)" || { rm -f -- "$key_candidate" "$source_candidate"; return 1; }
-  source_snapshot="$(mktemp /tmp/vps-manager-docker-source-old.XXXXXX)" || { rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot"; return 1; }
-  if [[ -f "$DOCKER_KEY_FILE" ]]; then cp -a -- "$DOCKER_KEY_FILE" "$key_snapshot" || { rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"; return 1; }; had_key=1; fi
-  if [[ -f "$DOCKER_SOURCE_FILE" ]]; then cp -a -- "$DOCKER_SOURCE_FILE" "$source_snapshot" || { rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"; return 1; }; had_source=1; fi
+  if [[ -n "$existing_source" && "$existing_source" != "$DOCKER_SOURCE_FILE" ]]; then
+    reuse_existing=1
+    info "检测到现有 Docker 官方源，将原样复用，不创建重复源：${existing_source}"
+    if log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install --download-only -y "${docker_packages[@]}"; then
+      repo_ready=1
+    fi
+  else
+    install -d -m 0755 "$(dirname "$DOCKER_KEY_FILE")" || return 1
+    install -d -m 0755 "$(dirname "$DOCKER_SOURCE_FILE")" || return 1
+    key_candidate="$(mktemp /tmp/vps-manager-docker-key.XXXXXX)" || return 1
+    source_candidate="$(mktemp /tmp/vps-manager-docker-source.XXXXXX)" || { rm -f -- "$key_candidate"; return 1; }
+    key_snapshot="$(mktemp /tmp/vps-manager-docker-key-old.XXXXXX)" || { rm -f -- "$key_candidate" "$source_candidate"; return 1; }
+    source_snapshot="$(mktemp /tmp/vps-manager-docker-source-old.XXXXXX)" || { rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot"; return 1; }
+    if [[ -f "$DOCKER_KEY_FILE" ]]; then cp -a -- "$DOCKER_KEY_FILE" "$key_snapshot" || { rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"; return 1; }; had_key=1; fi
+    if [[ -f "$DOCKER_SOURCE_FILE" ]]; then cp -a -- "$DOCKER_SOURCE_FILE" "$source_snapshot" || { rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"; return 1; }; had_source=1; fi
 
-  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$key_candidate" ||
-     ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$key_candidate"; then
-    rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"
-    error "Docker 官方 GPG key 下载或格式检查失败。"
-    return 1
+    if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$key_candidate" ||
+       ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$key_candidate"; then
+      rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"
+      error "Docker 官方 GPG key 下载或格式检查失败。"
+      return 1
+    fi
+    {
+      printf 'Types: deb\n'
+      printf 'URIs: https://download.docker.com/linux/ubuntu\n'
+      printf 'Suites: %s\n' "$codename"
+      printf 'Components: stable\n'
+      printf 'Architectures: %s\n' "$architecture"
+      printf 'Signed-By: %s\n' "$DOCKER_KEY_FILE"
+    } > "$source_candidate" || {
+      rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"
+      return 1
+    }
+    backup_file "$DOCKER_KEY_FILE" || rc=1
+    (( rc )) || backup_file "$DOCKER_SOURCE_FILE" || rc=1
+    (( rc )) || atomic_install_file "$key_candidate" "$DOCKER_KEY_FILE" 0644 || rc=1
+    (( rc )) || atomic_install_file "$source_candidate" "$DOCKER_SOURCE_FILE" 0644 || rc=1
+    if (( rc == 0 )) && log_command interactive apt-get update &&
+       log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install --download-only -y "${docker_packages[@]}"; then
+      repo_ready=1
+    fi
+    rm -f -- "$key_candidate" "$source_candidate"
   fi
-  {
-    printf 'Types: deb\n'
-    printf 'URIs: https://download.docker.com/linux/ubuntu\n'
-    printf 'Suites: %s\n' "$codename"
-    printf 'Components: stable\n'
-    printf 'Architectures: %s\n' "$architecture"
-    printf 'Signed-By: %s\n' "$DOCKER_KEY_FILE"
-  } > "$source_candidate" || {
-    rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"
-    return 1
-  }
-  backup_file "$DOCKER_KEY_FILE" || rc=1
-  (( rc )) || backup_file "$DOCKER_SOURCE_FILE" || rc=1
-  (( rc )) || atomic_install_file "$key_candidate" "$DOCKER_KEY_FILE" 0644 || rc=1
-  (( rc )) || atomic_install_file "$source_candidate" "$DOCKER_SOURCE_FILE" 0644 || rc=1
-  if (( rc == 0 )) && log_command interactive apt-get update &&
-     log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install --download-only -y "${docker_packages[@]}"; then
-    repo_ready=1
-  fi
-  rm -f -- "$key_candidate" "$source_candidate"
+
   if (( repo_ready == 0 )); then
-    restore_docker_repo_state "$key_snapshot" "$had_key" "$source_snapshot" "$had_source" || warn "Docker 原仓库配置恢复不完整，请检查 APT 源。"
-    rm -f -- "$key_snapshot" "$source_snapshot"
-    log_command quiet apt-get update || true
+    if (( reuse_existing == 0 )); then
+      restore_docker_repo_state "$key_snapshot" "$had_key" "$source_snapshot" "$had_source" || warn "Docker 原仓库配置恢复不完整，请检查 APT 源。"
+      rm -f -- "$key_snapshot" "$source_snapshot"
+      log_command quiet apt-get update || true
+    fi
     error "Docker 仓库或安装包预下载未通过，未移除现有冲突包。"
     return 1
   fi
 
   if (( ${#conflicts[@]} > 0 )); then
     confirm "仓库和安装包已验证。确认移除冲突包并安装 Docker CE？" || {
-      restore_docker_repo_state "$key_snapshot" "$had_key" "$source_snapshot" "$had_source" || warn "Docker 原仓库配置恢复不完整，请检查 APT 源。"
-      rm -f -- "$key_snapshot" "$source_snapshot"
-      log_command quiet apt-get update || true
+      if (( reuse_existing == 0 )); then
+        restore_docker_repo_state "$key_snapshot" "$had_key" "$source_snapshot" "$had_source" || warn "Docker 原仓库配置恢复不完整，请检查 APT 源。"
+        rm -f -- "$key_snapshot" "$source_snapshot"
+        log_command quiet apt-get update || true
+      fi
       info "已取消 Docker 安装，未移除冲突包。"
       return 0
     }
   fi
-  rm -f -- "$key_snapshot" "$source_snapshot"
+  if (( reuse_existing == 0 )); then
+    rm -f -- "$key_snapshot" "$source_snapshot"
+  fi
   if (( ${#conflicts[@]} > 0 )); then
     log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get remove -y "${conflicts[@]}" || return 1
   fi
   if ! log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y "${docker_packages[@]}"; then
-    error "Docker 安装失败；官方仓库与已下载包仍保留，可修复 APT/dpkg 后重新运行本操作。"
+    error "Docker 安装失败；有效仓库与已下载包仍保留，可修复 APT/dpkg 后重新运行本操作。"
     return 1
   fi
   systemctl enable --now docker || { error "Docker 已安装，但服务启动或开机启用失败。"; return 1; }
   ok "Docker Engine、Buildx 和 Compose 插件已安装。"
-  log_line "docker official engine installed for ${codename}/${architecture}"
+  log_line "docker official engine installed for ${codename}/${architecture}; source=${existing_source:-$DOCKER_SOURCE_FILE}"
   show_docker_status
 }
 

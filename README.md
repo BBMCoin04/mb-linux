@@ -1,6 +1,6 @@
 # mb-linux / vps-manager
 
-`vps-manager 1.4.0` 是面向个人 Ubuntu VPS 的中文交互式基础环境管理脚本，提供系统升级、SSH、UFW、Fail2ban、自动安全更新、BBR、Swap、Docker、DNS、状态检查和保守清理。
+`vps-manager 1.4.1` 是面向个人 Ubuntu VPS 的中文交互式基础环境管理脚本，提供系统升级、SSH、UFW、Fail2ban、自动安全更新、BBR、Swap、Docker、DNS、状态检查和保守清理。
 
 ## 支持范围
 
@@ -93,7 +93,8 @@ lm version              # 查看版本
 ### Docker
 
 - 使用 Docker 官方 Ubuntu 仓库，支持 `jammy`、`noble`、`questing` 和 `resolute`。
-- 先验证仓库并预下载 Docker CE 安装包，再请求移除冲突包。
+- 如果系统已有唯一且有效的 `docker.list` 或 `docker.sources`，会原样复用，不创建重复源；检测到多个官方源时拒绝继续并提示检查。
+- 没有现有官方源时，先创建并验证新源；随后预下载 Docker CE 安装包，再请求移除冲突包。
 - 不会自动删除 `/var/lib/docker`。
 - `docker` 组权限等同 root，添加用户前会再次确认。
 
