@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 PROGRAM="vps-manager"
 SUPPORTED_UBUNTU_CODENAMES=(jammy noble questing resolute)
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
@@ -941,7 +941,7 @@ show_swap_status() {
   free -h 2>/dev/null || true
   printf '\n活动 Swap：\n'
   if command -v swapon >/dev/null 2>&1; then
-    swapon --show --output=NAME,TYPE,SIZE,USED,PRIO 2>/dev/null || true
+    swapon --show=NAME,TYPE,SIZE,USED,PRIO 2>/dev/null || true
   fi
   printf '\n持久化配置：\n'
   grep -E '^[^#].*[[:space:]]swap[[:space:]]' /etc/fstab 2>/dev/null || printf '  未发现 fstab Swap 条目\n'
@@ -1747,7 +1747,8 @@ ssh_menu() {
 }
 
 show_fail2ban_status() {
-  local status service_state enabled_state port="未知" current_failed=0 total_failed=0 current_banned=0 total_banned=0 banned_list=""
+  local status service_state enabled_state port="由现有配置决定" current_failed=0 total_failed=0 current_banned=0 total_banned=0 banned_list=""
+  local maxretry="" findtime="" bantime=""
   if ! command -v fail2ban-client >/dev/null 2>&1; then
     printf 'Fail2ban：未安装\n'
     return 0
@@ -1764,20 +1765,40 @@ show_fail2ban_status() {
   fi
   status="$(LC_ALL=C fail2ban-client status sshd 2>/dev/null || true)"
   [[ -n "$status" ]] || {
-    printf 'Fail2ban：运行中\nSSH 保护：未启用\n'
+    printf 'Fail2ban：运行中\nSSH 保护：jail 暂未就绪或未启用\n'
     return 0
   }
   current_failed="$(printf '%s\n' "$status" | awk -F: '/Currently failed/{gsub(/[[:space:]]/, "", $2); print $2}')"
   total_failed="$(printf '%s\n' "$status" | awk -F: '/Total failed/{gsub(/[[:space:]]/, "", $2); print $2}')"
   current_banned="$(printf '%s\n' "$status" | awk -F: '/Currently banned/{gsub(/[[:space:]]/, "", $2); print $2}')"
   total_banned="$(printf '%s\n' "$status" | awk -F: '/Total banned/{gsub(/[[:space:]]/, "", $2); print $2}')"
-  banned_list="$(printf '%s\n' "$status" | awk -F: '/Banned IP list/{sub(/^[[:space:]]+/, "", $2); print $2}')"
+  banned_list="$(printf '%s\n' "$status" | awk '/Banned IP list/{sub(/^[^:]*:[[:space:]]*/, ""); print}')"
+  maxretry="$(fail2ban-client get sshd maxretry 2>/dev/null || true)"
+  findtime="$(fail2ban-client get sshd findtime 2>/dev/null || true)"
+  bantime="$(fail2ban-client get sshd bantime 2>/dev/null || true)"
   printf 'Fail2ban：运行中\n'
   printf 'SSH 保护：已启用（端口 %s）\n' "${port:-未知}"
   printf '失败登录：当前 %s，累计 %s\n' "${current_failed:-0}" "${total_failed:-0}"
   printf '封禁地址：当前 %s，累计 %s\n' "${current_banned:-0}" "${total_banned:-0}"
   [[ -z "$banned_list" ]] || printf '当前名单：%s\n' "$banned_list"
-  printf '规则：10 分钟失败 5 次，封禁 1 小时\n'
+  if [[ -n "$maxretry" && -n "$findtime" && -n "$bantime" ]]; then
+    printf '生效规则：%s 秒内失败 %s 次，封禁 %s 秒\n' "$findtime" "$maxretry" "$bantime"
+  fi
+}
+
+wait_for_fail2ban_sshd() {
+  local attempt
+  for (( attempt=1; attempt<=10; attempt++ )); do
+    fail2ban-client status sshd >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+fail2ban_sshd_rule_matches() {
+  [[ "$(fail2ban-client get sshd maxretry 2>/dev/null || true)" == "5" ]] &&
+    [[ "$(fail2ban-client get sshd findtime 2>/dev/null || true)" == "600" ]] &&
+    [[ "$(fail2ban-client get sshd bantime 2>/dev/null || true)" == "3600" ]]
 }
 
 sync_fail2ban_ssh_ports() {
@@ -1790,15 +1811,17 @@ sync_fail2ban_ssh_ports() {
   if sed -i -E "s/^port[[:space:]]*=.*/port = ${ports}/" "$FAIL2BAN_JAIL_FILE" &&
      command -v fail2ban-client >/dev/null 2>&1 &&
      fail2ban-client -t >/dev/null 2>&1 &&
-     systemctl restart fail2ban >/dev/null 2>&1; then
+     systemctl restart fail2ban >/dev/null 2>&1 &&
+     wait_for_fail2ban_sshd && fail2ban_sshd_rule_matches; then
     rm -f -- "$backup"
-    ok "Fail2ban SSH jail 已同步到端口 ${ports}。"
+    ok "Fail2ban SSH jail 已同步并验证端口 ${ports}。"
     return 0
   fi
   cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE" || true
   rm -f -- "$backup"
   systemctl restart fail2ban >/dev/null 2>&1 || true
-  warn "Fail2ban 端口同步失败，已恢复原配置。"
+  wait_for_fail2ban_sshd || true
+  warn "Fail2ban 端口同步或生效验证失败，已恢复原配置。"
   return 1
 }
 
@@ -1844,19 +1867,20 @@ enable_fail2ban() {
     return 1
   fi
   systemctl enable fail2ban >/dev/null 2>&1 || enabled_ok=0
-  if ! systemctl restart fail2ban; then
+  if ! systemctl restart fail2ban || ! wait_for_fail2ban_sshd || ! fail2ban_sshd_rule_matches; then
     if [[ -n "$backup" ]]; then cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE"; else rm -f -- "$FAIL2BAN_JAIL_FILE"; fi
     systemctl restart fail2ban >/dev/null 2>&1 || true
-    error "Fail2ban 启动失败，已恢复原配置。"
+    wait_for_fail2ban_sshd || true
+    error "Fail2ban 启动、jail 就绪或规则生效验证失败，已恢复原配置。"
     return 1
   fi
   if (( enabled_ok == 0 )); then
-    warn "Fail2ban 当前已运行，但开机启动设置失败，请检查 systemctl 状态。"
+    warn "Fail2ban 当前已运行且规则已生效，但开机启动设置失败，请检查 systemctl 状态。"
     show_fail2ban_status
     return 1
   fi
-  ok "Fail2ban SSH 防护已启用：5 次失败/10 分钟，封禁 1 小时。"
-  log_line "fail2ban sshd enabled on ports ${ports}"
+  ok "Fail2ban SSH 防护已启用并验证：5 次失败/10 分钟，封禁 1 小时。"
+  log_line "fail2ban sshd enabled and verified on ports ${ports}"
   show_fail2ban_status
 }
 
@@ -2131,10 +2155,21 @@ restore_docker_repo_state() {
   (( failed == 0 ))
 }
 
+docker_pending_upgrades() {
+  local package installed candidate
+  for package in "$@"; do
+    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || continue
+    installed="$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || true)"
+    candidate="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null | awk '/^[[:space:]]*Candidate:/{print $2; exit}')"
+    [[ -n "$installed" && -n "$candidate" && "$candidate" != "(none)" && "$candidate" != "$installed" ]] || continue
+    printf '%s: %s -> %s\n' "$package" "$installed" "$candidate"
+  done
+}
+
 install_docker_official() {
   local codename architecture package key_candidate="" source_candidate="" key_snapshot="" source_snapshot="" rc=0
   local existing_source="" had_key=0 had_source=0 repo_ready=0 reuse_existing=0
-  local -a conflicts=() official_sources=()
+  local -a conflicts=() official_sources=() pending_upgrades=()
   local -a conflict_packages=(docker.io docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)
   local -a docker_packages=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
   require_root
@@ -2241,6 +2276,22 @@ install_docker_official() {
         log_command quiet apt-get update || true
       fi
       info "已取消 Docker 安装，未移除冲突包。"
+      return 0
+    }
+  fi
+
+  mapfile -t pending_upgrades < <(docker_pending_upgrades "${docker_packages[@]}")
+  if (( ${#pending_upgrades[@]} > 0 )); then
+    warn "检测到已安装 Docker 组件有版本更新："
+    printf '  %s\n' "${pending_upgrades[@]}"
+    warn "安装更新可能重启 Docker daemon，并短暂中断正在运行的容器。"
+    confirm "确认安装上述 Docker 更新？" || {
+      if (( reuse_existing == 0 )); then
+        restore_docker_repo_state "$key_snapshot" "$had_key" "$source_snapshot" "$had_source" || warn "Docker 原仓库配置恢复不完整，请检查 APT 源。"
+        rm -f -- "$key_snapshot" "$source_snapshot"
+        log_command quiet apt-get update || true
+      fi
+      info "已取消 Docker 更新；预下载的软件包可能仍保留在 APT 缓存中。"
       return 0
     }
   fi
