@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 DEFAULT_REPO="BBMCoin04/mb-linux"
 REPO="${VPS_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${VPS_MANAGER_REF:-main}"
@@ -20,6 +20,8 @@ fi
 TEMP_FILE=""
 BACKUP_FILE=""
 ALIAS_CREATED=0
+INSTALL_CHANGED=0
+COMMITTED=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RED=$'\033[31m'
@@ -37,12 +39,6 @@ info() { printf '%s[信息]%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
 ok() { printf '%s[完成]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 error() { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 
-cleanup() {
-  [[ -z "$TEMP_FILE" ]] || rm -f -- "$TEMP_FILE"
-  [[ -z "$BACKUP_FILE" ]] || rm -f -- "$BACKUP_FILE"
-}
-trap cleanup EXIT HUP INT TERM
-
 restore_manager() {
   if [[ -n "$BACKUP_FILE" && -s "$BACKUP_FILE" ]]; then
     install -m 0755 "$BACKUP_FILE" "$INSTALL_PATH" || true
@@ -51,6 +47,26 @@ restore_manager() {
   fi
   (( ALIAS_CREATED == 0 )) || rm -f -- "$ALIAS_PATH"
 }
+
+cleanup() {
+  local rc=$?
+  if (( INSTALL_CHANGED == 1 && COMMITTED == 0 )); then
+    restore_manager
+  fi
+  [[ -z "$TEMP_FILE" ]] || rm -f -- "$TEMP_FILE"
+  [[ -z "$BACKUP_FILE" ]] || rm -f -- "$BACKUP_FILE"
+  return "$rc"
+}
+
+on_signal() {
+  trap - HUP INT TERM
+  exit "$1"
+}
+
+trap cleanup EXIT
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 if (( EUID != 0 )); then
   error "安装需要 root 权限，请在命令前使用 sudo。"
@@ -90,7 +106,7 @@ else
     curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$SOURCE_URL" -o "$TEMP_FILE"
     download_rc=$?
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TEMP_FILE" "$SOURCE_URL"
+    wget --https-only -qO "$TEMP_FILE" "$SOURCE_URL"
     download_rc=$?
   else
     error "需要 curl 或 wget 才能下载安装。"
@@ -145,14 +161,17 @@ if [[ -f "$INSTALL_PATH" ]]; then
   BACKUP_FILE="$(mktemp /tmp/vps-manager-existing.XXXXXX.sh)" || exit 1
   cp -a -- "$INSTALL_PATH" "$BACKUP_FILE" || exit 1
 fi
+INSTALL_CHANGED=1
 if ! install -m 0755 "$TEMP_FILE" "$INSTALL_PATH"; then
   restore_manager
+  INSTALL_CHANGED=0
   error "管理器安装失败，已尝试恢复原版本。"
   exit 1
 fi
 if [[ -n "$ALIAS_PATH" && ! -e "$ALIAS_PATH" && ! -L "$ALIAS_PATH" ]]; then
   if ! ln -s "$INSTALL_PATH" "$ALIAS_PATH"; then
     restore_manager
+    INSTALL_CHANGED=0
     error "无法创建快捷命令 ${ALIAS_PATH}。"
     exit 1
   fi
@@ -161,9 +180,11 @@ if [[ -n "$ALIAS_PATH" && ! -e "$ALIAS_PATH" && ! -L "$ALIAS_PATH" ]]; then
 fi
 if [[ "$("$INSTALL_PATH" version 2>/dev/null)" != "vps-manager ${MANAGER_VERSION}" ]]; then
   restore_manager
+  INSTALL_CHANGED=0
   error "安装后的版本自检失败，已恢复原版本。"
   exit 1
 fi
+COMMITTED=1
 
 hash_value="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || true)"
 ok "vps-manager ${MANAGER_VERSION} 已安装到 ${INSTALL_PATH}"

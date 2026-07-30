@@ -1,148 +1,33 @@
 # mb-linux / vps-manager
 
-`vps-manager 1.3.1` 是一个面向 Ubuntu VPS 的中文管理脚本，用菜单完成系统初始化、SSH、防火墙、BBR、Swap、Docker、DNS 和日常维护。
+`vps-manager 1.4.0` 是面向个人 Ubuntu VPS 的中文交互式基础环境管理脚本，提供系统升级、SSH、UFW、Fail2ban、自动安全更新、BBR、Swap、Docker、DNS、状态检查和保守清理。
 
-> 仅支持 Ubuntu。修改 SSH、防火墙或网络前，请保留当前 SSH 会话，并确保可以使用云厂商控制台救援。
+## 支持范围
+
+目标支持：
+
+- Ubuntu 22.04 LTS（jammy）
+- Ubuntu 24.04 LTS（noble）
+- Ubuntu 26.04 LTS（resolute）
+
+同时识别 Ubuntu 25.10（questing）。其他 Ubuntu 版本按通用流程运行并显示未专项验证提示；不支持 Debian 或其他发行版。
+
+> 修改 SSH、防火墙或 DNS 前，请保持当前 SSH 会话，并确保可以使用云厂商控制台救援。
 
 ## 安装
 
-推荐先下载，再执行：
+推荐先下载并查看安装器，再执行：
 
 ```bash
-curl -fsSLo /tmp/vps-manager-install.sh "https://raw.githubusercontent.com/BBMCoin04/mb-linux/main/install.sh?ts=$(date +%s)"
+curl -fsSLo /tmp/vps-manager-install.sh \
+  "https://raw.githubusercontent.com/BBMCoin04/mb-linux/main/install.sh?ts=$(date +%s)"
 sudo bash /tmp/vps-manager-install.sh
 ```
 
-从 ZIP 或 Git 仓库安装：
+从 ZIP 或 Git 仓库安装时，安装器会优先使用同目录的 `vps-manager.sh`：
 
 ```bash
 sudo bash install.sh
-```
-
-安装完成后，随时打开菜单：
-
-```bash
-sudo lm
-```
-
-也可以使用完整命令：
-
-```bash
-sudo vps-manager
-```
-
-## 主菜单
-
-```text
-  1. 基础初始化向导
-  2. 系统升级、主机名、时区与重启
-  3. SSH/root 登录设置
-  4. Fail2ban 与自动安全更新
-  5. 防火墙模式
-  6. BBR 与网络优化
-  7. Swap 管理
-  8. Docker 管理
-  9. DNS 配置
- 10. AI/流媒体访问检测
- 11. 系统状态与最近操作
- 12. 保守系统清理
- 13. 更新 vps-manager
-  0. 退出
-```
-
-## 新 VPS 怎么用
-
-第一次使用直接选择菜单 `1`，脚本会逐项询问：
-
-1. 设置主机名和时区。
-2. 升级 Ubuntu 并安装常用工具。
-3. 创建 Swap、启用 BBR。
-4. 配置 Fail2ban 和自动安全更新。
-5. 安装 Docker。
-6. 选择防火墙模式并配置 DNS。
-
-每一步都可以跳过。脚本不会静默重启 VPS。
-
-## 重要提醒
-
-- 修改 SSH 端口前，先在云厂商安全组中放行新端口。
-- 修改 SSH 时保持当前连接，并用新窗口测试成功后再关闭旧连接。
-- Ubuntu 24.04 的 `ssh.socket` 模式已支持；脚本会重载 socket 并检查目标端口是否真实监听。
-- 没有配置并测试 SSH 公钥前，不要关闭密码登录。
-- UFW 不能代替云厂商安全组；两边都要正确放行端口。
-- 加入 `docker` 用户组等同于获得 root 级权限，不要随意添加用户。
-- AI/流媒体检测只代表网络可达性，不代表账号、订阅或具体内容一定可用。
-
-## 防火墙模式
-
-菜单 `5` 提供四项操作：
-
-```text
-1. 宽松模式（关闭 UFW）
-2. 收紧模式（只允许 SSH 和服务端口）
-3. 开启端口
-4. 关闭端口
-```
-
-- **宽松模式**：关闭 UFW，主机不再过滤入站端口；现有规则仍会保留。
-- **收紧模式**：备份并重建 UFW，最先放行当前全部 SSH 端口，再按端口清单放行服务，拒绝其他入站和转发。Docker 正在运行时会询问是否重启 Docker 以恢复 NAT 和端口发布规则。
-- **开启/关闭端口**：输入 `8080`、`8080/tcp` 或 `53/udp`，脚本会显示防火墙状态和监听服务，再请求确认。
-
-端口清单保存在 `/etc/vps-manager/ports.conf`。关闭的默认端口不会被收紧模式重新打开，自定义端口也不会丢失。当前 SSH 端口不能从端口菜单关闭。Docker 映射到公网的端口可能绕过 UFW，不需要的容器端口不要发布。
-
-## DNS 配置
-
-自定义 DNS 只接受空格分隔的 IPv4/IPv6 地址，写入前会逐项校验。非 systemd-resolved 环境会把 `/etc/resolv.conf` 安全替换为 `0644` 普通文件，不会写穿原符号链接。检测到 cloud-init 或 netplan 时会提醒在重启后复查，因为云镜像网络配置仍可能覆盖 DNS。
-
-## AI 与流媒体检测
-
-选择菜单 `10` 后直接检测 OpenAI、Gemini、Claude、Netflix、Disney+ 和 YouTube，只显示“可以访问 / 不可访问 / 检测失败”。
-
-## 保守系统清理
-
-选择菜单 `12`，或运行：
-
-```bash
-sudo lm cleanup-system
-```
-
-确认后只会清理：
-
-- APT 下载缓存。
-- 系统策略认定的过期临时文件。
-- 14 天以前的 systemd journal 归档。
-- 超过 5 MiB 的 vps-manager 日志旧记录。
-
-不会执行 `autoremove`、Docker prune，不会删除证书、密钥、用户文件或防火墙规则。
-
-## 更新与修复
-
-选择菜单 `13`，或运行：
-
-```bash
-sudo lm update
-```
-
-更新会检查脚本标识、Bash 语法和版本，拒绝降级；失败时尝试恢复原版本。更新成功后会自动打开新版菜单。
-
-`1.3.1` 修复 Ubuntu 24.04 `ssh.socket` 端口变更、关闭密码登录时遗漏 keyboard-interactive、自定义 DNS 输入与 `resolv.conf` 软链接写入问题；同时持久化 cloud-init 主机名、识别多个 SSH 端口、补充 Fail2ban systemd 后端依赖，并在 UFW 重建后处理 Docker 网络提示。
-
-从 `1.2.0` 升级时，请重新执行一次安装命令；`1.2.0` 的菜单更新存在系统版本误判。升级后即可继续使用菜单 `13`。菜单更新会先保留结果，按 Enter 后再重新载入新版。需要修复 `lm` 命令时也可重新运行安装器。
-
-## 常用命令
-
-```bash
-sudo lm                 # 打开菜单
-sudo lm init            # 基础初始化向导
-sudo lm status          # 查看系统状态
-sudo lm ports           # 管理防火墙模式和端口
-sudo lm swap            # Swap 管理
-sudo lm security        # Fail2ban 与自动安全更新
-sudo lm docker          # Docker 管理
-sudo lm cleanup-system  # 保守系统清理
-sudo lm update          # 更新管理器
-lm version              # 查看版本
-lm help                 # 查看帮助
 ```
 
 安装位置：
@@ -152,11 +37,94 @@ lm help                 # 查看帮助
 /usr/local/sbin/lm -> /usr/local/sbin/vps-manager
 ```
 
-日志和备份位置：
+## 常用命令
 
-```text
-/var/log/vps-manager/vps-manager.log
-/var/backups/vps-manager/
+```bash
+sudo lm                 # 打开菜单
+sudo lm init            # 基础初始化向导
+sudo lm status          # 系统与服务状态
+sudo lm ports           # UFW 模式与端口
+sudo lm swap            # Swap 管理
+sudo lm security        # Fail2ban 与自动安全更新
+sudo lm docker          # Docker 管理
+sudo lm cleanup-system  # 保守系统清理
+sudo lm update          # 更新管理器
+lm version              # 查看版本
 ```
 
-配置备份统一放在专用目录，不会留在 APT、SSH 或 DNS 配置目录中。
+初始化向导中的每一步都可跳过，脚本不会静默重启 VPS。
+
+## 关键行为
+
+### SSH
+
+- 新增 SSH 端口时会显式保留当前全部 SSH 端口。
+- UFW 已启用时先放行新端口，再修改 SSH。
+- 配置需通过 `sshd -t`、有效值检查、服务重载和实际监听检查。
+- Ubuntu 24.04/26.04 的 `ssh.socket` 会执行 `daemon-reload` 并重启 socket。
+- 脚本不会自动删除旧 SSH 端口。请先用新窗口验证，再手动清理不再需要的端口和云安全组规则。
+- 关闭 root 登录前，必须检测到具有 `sudo` 权限和 `authorized_keys` 的普通用户。
+
+### UFW
+
+- 宽松模式关闭 UFW 并保留现有规则。
+- 收紧模式备份并重建 UFW，优先放行检测到的全部 SSH 端口；无法可靠识别 SSH 端口时拒绝执行。
+- 云厂商安全组需要单独配置。
+- Docker 发布到公网的容器端口可能绕过 UFW；脚本只提示，不接管 `DOCKER-USER` 链。
+
+服务端口清单：
+
+```text
+/etc/vps-manager/ports.conf
+```
+
+### Swap
+
+- 默认创建 `/swapfile`，并记录管理状态。
+- 只有带有匹配管理状态的 Swap 才允许从菜单删除。
+- 升级前已经存在的 Swap 不会被自动接管；可在创建 Swap 菜单中明确确认接管。
+
+### DNS
+
+- systemd-resolved 正在实际管理 DNS 时修改 `resolved.conf`；否则安全替换 `/etc/resolv.conf`，不会写穿原符号链接。
+- 修改后必须通过真实域名解析测试，否则恢复原配置。
+- 脚本不修改 cloud-init 或 netplan。它们仍可能在重启后覆盖下层 DNS，脚本会提示复查。
+
+### Docker
+
+- 使用 Docker 官方 Ubuntu 仓库，支持 `jammy`、`noble`、`questing` 和 `resolute`。
+- 先验证仓库并预下载 Docker CE 安装包，再请求移除冲突包。
+- 不会自动删除 `/var/lib/docker`。
+- `docker` 组权限等同 root，添加用户前会再次确认。
+
+### 自动安全更新
+
+- 使用 Ubuntu `unattended-upgrades`，自动重启保持关闭。
+- 写入后验证 APT 生效值和 systemd timer；验证失败恢复原配置并报告失败。
+
+## 更新行为
+
+`sudo lm update` 只替换管理器程序并执行版本自检，不会自动运行初始化向导，也不会迁移或重写现有 SSH、UFW、DNS、Swap、Docker 或 Fail2ban 配置。修复后的行为在下次主动选择对应菜单操作时生效。
+
+更新通过 HTTPS 从配置的 GitHub 仓库和引用下载，并以 root 安装。脚本标识、Bash 语法和版本检查用于防止错误文件及降级，不等同于发布者签名验证。
+
+## 清理与备份
+
+保守清理只执行：
+
+- 清理 APT 下载缓存。
+- 按 systemd-tmpfiles 策略清理过期临时文件。
+- 清理 14 天以前的 systemd journal 归档。
+- 日志超过 5 MiB 时保留最近 2000 行。
+
+不会执行 `autoremove`、Docker prune，也不会删除证书、密钥、用户文件或防火墙规则。
+
+```text
+日志：/var/log/vps-manager/vps-manager.log
+备份：/var/backups/vps-manager/
+配置：/etc/vps-manager/
+```
+
+## 功能边界
+
+脚本不提供 Debian 兼容、非交互批处理、SSH 定时回滚、旧 SSH 端口自动清理、cloud-init/netplan 接管、Docker 防火墙链集成、应用服务降权，以及 Reality、ACME、Sing-box 等上层代理或证书功能。
