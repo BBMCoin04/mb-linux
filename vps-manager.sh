@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 PROGRAM="vps-manager"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
@@ -22,7 +22,10 @@ PORT_CONFIG_FILE="${VPS_MANAGER_PORT_CONFIG_FILE:-${CONFIG_ROOT}/ports.conf}"
 SWAP_FILE="${VPS_MANAGER_SWAP_FILE:-/swapfile}"
 SWAP_SYSCTL_FILE="/etc/sysctl.d/99-vps-manager-swap.conf"
 FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/vps-manager-sshd.local"
-SSHD_MANAGED_FILE="/etc/ssh/sshd_config.d/00-vps-manager.conf"
+SSHD_MANAGED_FILE="${VPS_MANAGER_SSHD_MANAGED_FILE:-/etc/ssh/sshd_config.d/00-vps-manager.conf}"
+CLOUD_HOSTNAME_FILE="${VPS_MANAGER_CLOUD_HOSTNAME_FILE:-/etc/cloud/cloud.cfg.d/99-vps-manager-hostname.cfg}"
+RESOLVED_CONFIG_FILE="${VPS_MANAGER_RESOLVED_CONFIG_FILE:-/etc/systemd/resolved.conf}"
+RESOLV_CONF_FILE="${VPS_MANAGER_RESOLV_CONF_FILE:-/etc/resolv.conf}"
 APT_CONFIG_DIR="${VPS_MANAGER_APT_CONFIG_DIR:-/etc/apt/apt.conf.d}"
 AUTO_UPGRADES_FILE="${VPS_MANAGER_AUTO_UPGRADES_FILE:-${APT_CONFIG_DIR}/20auto-upgrades}"
 AUTO_UPGRADES_OPTIONS_FILE="${VPS_MANAGER_AUTO_UPGRADES_OPTIONS_FILE:-${APT_CONFIG_DIR}/52vps-manager-unattended-upgrades}"
@@ -336,6 +339,12 @@ set_hostname() {
   confirm "确认修改主机名？" || return 0
   backup_file "$hosts_file" || return 1
   hostnamectl set-hostname "$new_hostname" || return 1
+  if [[ -d "$(dirname "$CLOUD_HOSTNAME_FILE")" ]]; then
+    backup_file "$CLOUD_HOSTNAME_FILE" || warn "无法备份 cloud-init 主机名配置，将继续设置当前主机名。"
+    if ! printf 'preserve_hostname: true\n' > "$CLOUD_HOSTNAME_FILE" || ! chmod 0644 "$CLOUD_HOSTNAME_FILE"; then
+      warn "无法写入 ${CLOUD_HOSTNAME_FILE}；cloud-init 可能在重启后恢复旧主机名。"
+    fi
+  fi
   if grep -qE '^127\.0\.1\.1[[:space:]]+' "$hosts_file"; then
     if ! sed -i -E "s/^127\.0\.1\.1[[:space:]]+.*/127.0.1.1 ${new_hostname}/" "$hosts_file"; then
       hostnamectl set-hostname "$old_hostname" || true
@@ -458,12 +467,17 @@ ufw_is_active() {
 }
 
 build_tight_firewall_rules() {
-  local ssh_rule rule
+  local ssh_port ssh_rule rule
   local -A seen=()
-  ssh_rule="$(current_ssh_port)/tcp"
   load_managed_service_ports
-  PORT_RULES=("$ssh_rule")
-  seen["$ssh_rule"]=1
+  PORT_RULES=()
+  while IFS= read -r ssh_port; do
+    [[ "$ssh_port" =~ ^[0-9]+$ ]] || continue
+    ssh_rule="${ssh_port}/tcp"
+    [[ -n "${seen[$ssh_rule]:-}" ]] && continue
+    PORT_RULES+=("$ssh_rule")
+    seen["$ssh_rule"]=1
+  done < <(current_ssh_ports)
   for rule in "${MANAGED_PORTS[@]}"; do
     [[ -n "${seen[$rule]:-}" ]] && continue
     PORT_RULES+=("$rule")
@@ -587,15 +601,14 @@ open_managed_port() {
 }
 
 close_managed_port() {
-  local rule ssh_rule was_rule=0 was_managed=0
+  local rule was_rule=0 was_managed=0
   local -a previous=()
   require_root
   require_ubuntu || return 1
   ensure_ufw || return 1
   rule="$(prompt_port_rule)" || return 1
-  ssh_rule="$(current_ssh_port)/tcp"
-  if [[ "$rule" == "$ssh_rule" ]]; then
-    error "拒绝关闭当前 SSH 端口 ${ssh_rule}。请先在 SSH 菜单中修改并验证新端口。"
+  if current_ssh_ports | grep -Fxq "${rule%/*}" && [[ "${rule#*/}" == "tcp" ]]; then
+    error "拒绝关闭当前 SSH 端口 ${rule}。请先在 SSH 菜单中修改并验证新端口。"
     return 1
   fi
   load_managed_service_ports
@@ -657,14 +670,14 @@ set_firewall_relaxed() {
 }
 
 set_firewall_tight() {
-  local ssh_port backup_dir rule was_active=0 failed=0
+  local ssh_ports backup_dir rule was_active=0 failed=0 docker_was_active=0
   require_root
   require_ubuntu || return 1
   ensure_ufw || return 1
   build_tight_firewall_rules || return 1
-  ssh_port="$(current_ssh_port)"
+  ssh_ports="$(current_ssh_ports | paste -sd',' -)"
   printf '\n%s收紧模式%s\n' "$C_BOLD" "$C_RESET"
-  printf '  当前 SSH：%s/tcp（最先放行）\n' "$ssh_port"
+  printf '  当前 SSH：%s/tcp（全部优先放行）\n' "${ssh_ports//,//tcp,}"
   printf '  允许端口：%s\n' "${PORT_RULES[*]}"
   printf '  默认策略：拒绝其他入站和转发，允许出站\n'
   warn "将清空现有 UFW 规则并按以上清单重建；云厂商安全组仍需单独配置。"
@@ -676,6 +689,7 @@ set_firewall_tight() {
   fi
 
   ufw_is_active && was_active=1
+  systemctl is-active --quiet docker 2>/dev/null && docker_was_active=1
   backup_dir="${BACKUP_ROOT}/ufw-$(date '+%Y%m%d-%H%M%S').$$"
   install -d -m 0700 "$backup_dir" || return 1
   cp -a -- /etc/ufw "$backup_dir/ufw" || { error "无法备份 UFW 配置。"; return 1; }
@@ -701,8 +715,14 @@ set_firewall_tight() {
     error "收紧模式应用失败，已尝试恢复原配置。备份：${backup_dir}"
     return 1
   fi
-  ok "已切换到收紧模式，当前 SSH ${ssh_port}/tcp 保持放行。"
+  ok "已切换到收紧模式，当前 SSH 端口均保持放行。"
   info "UFW 备份：${backup_dir}"
+  if (( docker_was_active )); then
+    warn "检测到 Docker 正在运行；UFW 重建可能影响容器 NAT 或端口发布规则。"
+    if confirm "是否现在重启 Docker 以重建网络规则？"; then
+      systemctl restart docker || warn "Docker 重启失败，请立即检查容器网络。"
+    fi
+  fi
   log_line "firewall mode changed to tight: ${PORT_RULES[*]}"
   show_firewall_status
 }
@@ -777,8 +797,7 @@ enable_bbr() {
     ok "BBR 配置已写入 /etc/sysctl.d/99-vps-manager-bbr.conf"
     bbr_status
     if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
-      info "BBR 已即时生效，通常不需要重启。"
-      offer_reboot "如需验证开机后 BBR 配置，可选择现在重启；通常可以跳过。"
+      ok "BBR 已即时生效，不需要重启。"
     elif reboot_required; then
       offer_reboot "BBR 配置已写入，但系统同时标记为需要重启。"
     fi
@@ -986,13 +1005,70 @@ swap_menu() {
   done
 }
 
+validate_ipv4() {
+  local value="$1" octet
+  local -a octets=()
+  IFS='.' read -r -a octets <<< "$value"
+  (( ${#octets[@]} == 4 )) || return 1
+  for octet in "${octets[@]}"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] && (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+count_ipv6_groups() {
+  local side="$1" group
+  local -a groups=()
+  [[ -n "$side" ]] || { printf '0'; return 0; }
+  IFS=':' read -r -a groups <<< "$side"
+  (( ${#groups[@]} > 0 )) || return 1
+  for group in "${groups[@]}"; do
+    [[ "$group" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+  done
+  printf '%d' "${#groups[@]}"
+}
+
+validate_ipv6() {
+  local value="${1,,}" left right left_count right_count group_count ipv4_tail
+  [[ "$value" == *:* && "$value" != *'%'* ]] || return 1
+  if [[ "$value" == *.* ]]; then
+    ipv4_tail="${value##*:}"
+    validate_ipv4 "$ipv4_tail" || return 1
+    value="${value%:*}:0:0"
+  fi
+  [[ "$value" =~ ^[0-9a-f:]+$ && "$value" != *:::* ]] || return 1
+  if [[ "$value" == *::* ]]; then
+    [[ "${value#*::}" != *::* ]] || return 1
+    left="${value%%::*}"
+    right="${value#*::}"
+    left_count="$(count_ipv6_groups "$left")" || return 1
+    right_count="$(count_ipv6_groups "$right")" || return 1
+    (( left_count + right_count < 8 ))
+  else
+    [[ "$value" != :* && "$value" != *: ]] || return 1
+    group_count="$(count_ipv6_groups "$value")" || return 1
+    (( group_count == 8 ))
+  fi
+}
+
+validate_dns_server_list() {
+  local values="$1" allow_empty="${2:-0}" server count=0
+  for server in $values; do
+    if ! validate_ipv4 "$server" && ! validate_ipv6 "$server"; then
+      error "DNS 地址格式不正确：${server}"
+      return 1
+    fi
+    count=$((count + 1))
+  done
+  (( count > 0 || allow_empty == 1 ))
+}
+
 show_dns_status() {
   if command -v resolvectl >/dev/null 2>&1; then
     resolvectl dns 2>/dev/null || true
     resolvectl domain 2>/dev/null || true
   fi
-  printf '\n/etc/resolv.conf：\n'
-  sed -n '1,20p' /etc/resolv.conf 2>/dev/null || true
+  printf '\n%s：\n' "$RESOLV_CONF_FILE"
+  sed -n '1,20p' "$RESOLV_CONF_FILE" 2>/dev/null || true
 }
 
 set_resolved_key() {
@@ -1009,11 +1085,17 @@ set_resolved_key() {
 }
 
 apply_dns_servers() {
-  local label="$1" dns="$2" fallback="$3" resolved_file="/etc/systemd/resolved.conf" rollback
+  local label="$1" dns="$2" fallback="$3" resolved_file="$RESOLVED_CONFIG_FILE"
+  local rollback rollback_dir temporary server
   require_root
   require_ubuntu || return 1
+  validate_dns_server_list "$dns" || return 1
+  validate_dns_server_list "$fallback" 1 || return 1
   printf 'DNS 方案：%s\n' "$label"
   printf 'DNS=%s\nFallbackDNS=%s\n' "$dns" "$fallback"
+  if command -v cloud-init >/dev/null 2>&1 || [[ -d /etc/netplan ]]; then
+    warn "检测到 cloud-init 或 netplan；其网络配置可能在重启后覆盖系统 DNS，请重启后复查。"
+  fi
   confirm "确认修改 DNS 配置？" || return 0
 
   if command -v systemctl >/dev/null 2>&1 && [[ -f "$resolved_file" ]]; then
@@ -1035,25 +1117,30 @@ apply_dns_servers() {
     return 1
   fi
 
-  rollback="$(mktemp /tmp/vps-manager-resolv.XXXXXX)" || return 1
-  if ! cp -L -- /etc/resolv.conf "$rollback"; then
-    rm -f -- "$rollback"
+  rollback_dir="$(mktemp -d /tmp/vps-manager-resolv-backup.XXXXXX)" || return 1
+  if ! cp -a -- "$RESOLV_CONF_FILE" "$rollback_dir/resolv.conf"; then
+    rm -rf -- "$rollback_dir"
     return 1
   fi
-  backup_file /etc/resolv.conf || { rm -f -- "$rollback"; return 1; }
-  if ! {
+  backup_file "$RESOLV_CONF_FILE" || { rm -rf -- "$rollback_dir"; return 1; }
+  temporary="$(mktemp /tmp/vps-manager-resolv.XXXXXX)" || { rm -rf -- "$rollback_dir"; return 1; }
+  {
     printf '# Managed by vps-manager on %s\n' "$(date '+%F %T %z')"
     for server in $dns $fallback; do
       printf 'nameserver %s\n' "$server"
     done
-  } > /etc/resolv.conf; then
-    cat "$rollback" > /etc/resolv.conf || true
-    rm -f -- "$rollback"
-    error "写入 /etc/resolv.conf 失败，已尝试恢复原内容。"
+  } > "$temporary"
+  if ! rm -f -- "$RESOLV_CONF_FILE" || ! atomic_install_file "$temporary" "$RESOLV_CONF_FILE" 0644; then
+    rm -f -- "$RESOLV_CONF_FILE"
+    cp -a -- "$rollback_dir/resolv.conf" "$RESOLV_CONF_FILE" || true
+    rm -f -- "$temporary"
+    rm -rf -- "$rollback_dir"
+    error "写入 /etc/resolv.conf 失败，已尝试恢复原路径。"
     return 1
   fi
-  rm -f -- "$rollback"
-  ok "/etc/resolv.conf 已更新。"
+  rm -f -- "$temporary"
+  rm -rf -- "$rollback_dir"
+  ok "${RESOLV_CONF_FILE} 已更新为普通 0644 文件。"
   show_dns_status
 }
 
@@ -1062,8 +1149,10 @@ custom_dns() {
   read -r -p "主 DNS（空格分隔，例如 1.1.1.1 8.8.8.8）：" dns
   dns="$(trim "$dns")"
   [[ -n "$dns" ]] || { error "主 DNS 不能为空。"; return 1; }
+  validate_dns_server_list "$dns" || return 1
   read -r -p "备用 DNS（空格分隔，可留空）：" fallback
   fallback="$(trim "$fallback")"
+  validate_dns_server_list "$fallback" 1 || return 1
   apply_dns_servers "自定义" "$dns" "$fallback"
 }
 
@@ -1100,14 +1189,36 @@ sshd_config_file() {
   printf '/etc/ssh/sshd_config'
 }
 
-current_ssh_port() {
-  local sshd
+current_ssh_ports() {
+  local sshd connection_port="${SSH_CONNECTION:-}" output
   sshd="$(sshd_bin)"
   if [[ -x "$sshd" ]]; then
-    "$sshd" -T 2>/dev/null | awk '$1=="port" {print $2; found=1; exit} END {if(!found) print 22}'
+    output="$("$sshd" -T 2>/dev/null | awk '$1=="port" && !seen[$2]++ {print $2}')"
+  fi
+  if [[ -n "$connection_port" ]]; then
+    connection_port="$(awk '{print $4}' <<< "$connection_port")"
+    [[ "$connection_port" =~ ^[0-9]+$ ]] && output="${output}${output:+$'\n'}${connection_port}"
+  fi
+  if [[ -n "$output" ]]; then
+    printf '%s\n' "$output" | awk '!seen[$0]++'
   else
     printf '22\n'
   fi
+}
+
+current_ssh_port() {
+  current_ssh_ports | head -n 1
+}
+
+ssh_socket_activated() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null
+}
+
+ssh_port_listening() {
+  local port="$1"
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -H -ltn 2>/dev/null | awk -v suffix=":${port}" '$4 ~ suffix "$" {found=1} END {exit !found}'
 }
 
 show_ssh_status() {
@@ -1116,12 +1227,12 @@ show_ssh_status() {
   config="$(sshd_config_file)"
   if [[ -x "$sshd" ]]; then
     printf 'sshd 有效配置：\n'
-    "$sshd" -T 2>/dev/null | awk '/^(port|permitrootlogin|passwordauthentication) / {print "  " $0}' || true
+    "$sshd" -T 2>/dev/null | awk '/^(port|permitrootlogin|passwordauthentication|kbdinteractiveauthentication) / {print "  " $0}' || true
   else
     warn "未找到 sshd。"
   fi
   printf '\n%s 中的相关配置：\n' "$config"
-  grep -Ein '^[#[:space:]]*(Port|PermitRootLogin|PasswordAuthentication)[[:space:]]+' "$config" 2>/dev/null || true
+  grep -Ein '^[#[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]+' "$config" 2>/dev/null || true
   printf '\nvps-manager 管理文件：%s\n' "$SSHD_MANAGED_FILE"
   sed -n '1,80p' "$SSHD_MANAGED_FILE" 2>/dev/null || printf '  尚未创建\n'
 }
@@ -1137,6 +1248,14 @@ set_sshd_option_in_file() {
 
 reload_ssh_service() {
   if command -v systemctl >/dev/null 2>&1; then
+    if ssh_socket_activated; then
+      systemctl daemon-reload || return 1
+      systemctl restart ssh.socket || return 1
+      if systemctl is-active --quiet ssh.service 2>/dev/null; then
+        systemctl reload ssh.service || return 1
+      fi
+      return 0
+    fi
     systemctl reload ssh 2>/dev/null && return 0
     systemctl reload sshd 2>/dev/null && return 0
   fi
@@ -1144,8 +1263,10 @@ reload_ssh_service() {
   service sshd reload 2>/dev/null && return 0
 }
 
-apply_sshd_option() {
-  local option="$1" value="$2" config backup="" sshd effective key had_file=0
+apply_sshd_options() {
+  local config backup="" sshd option value key effective index valid=1 had_file=0
+  local -a settings=("$@")
+  (( ${#settings[@]} > 0 && ${#settings[@]} % 2 == 0 )) || return 1
   require_root
   require_ubuntu || return 1
   config="$(sshd_config_file)"
@@ -1154,7 +1275,10 @@ apply_sshd_option() {
   [[ -x "$sshd" ]] || { error "未找到 sshd。"; return 1; }
 
   show_ssh_status
-  printf '\n准备设置：%s %s\n' "$option" "$value"
+  printf '\n准备设置：\n'
+  for (( index = 0; index < ${#settings[@]}; index += 2 )); do
+    printf '  %s %s\n' "${settings[$index]}" "${settings[$((index + 1))]}"
+  done
   confirm "确认修改 SSH 配置？" || return 0
   install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")"
   if [[ -f "$SSHD_MANAGED_FILE" ]]; then
@@ -1166,29 +1290,58 @@ apply_sshd_option() {
     error "无法创建 SSH 管理配置。"
     return 1
   fi
-  if ! set_sshd_option_in_file "$SSHD_MANAGED_FILE" "$option" "$value" || ! chmod 0644 "$SSHD_MANAGED_FILE"; then
-    if (( had_file )); then cp -a -- "$backup" "$SSHD_MANAGED_FILE"; else rm -f -- "$SSHD_MANAGED_FILE"; fi
-    error "写入 SSH 管理配置失败，已恢复。"
-    return 1
-  fi
 
-  if "$sshd" -t -f "$config"; then
-    key="${option,,}"
-    effective="$("$sshd" -T -f "$config" 2>/dev/null | awk -v key="$key" '$1==key {print $2; exit}')"
-    if [[ "${effective,,}" == "${value,,}" ]]; then
-      if reload_ssh_service; then
-        ok "SSH 配置已更新并重载：${SSHD_MANAGED_FILE}"
-        [[ -n "$backup" ]] && info "备份：${backup}"
-        return 0
-      fi
-      warn "配置校验通过，但 SSH 服务重载失败，正在恢复。"
-    else
-      error "最终生效值为 ${effective:-未知}，不是目标值 ${value}，正在恢复。"
+  for (( index = 0; index < ${#settings[@]}; index += 2 )); do
+    option="${settings[$index]}"
+    value="${settings[$((index + 1))]}"
+    if ! set_sshd_option_in_file "$SSHD_MANAGED_FILE" "$option" "$value"; then
+      valid=0
+      break
     fi
+  done
+  (( valid )) && chmod 0644 "$SSHD_MANAGED_FILE" || valid=0
+
+  if (( valid )) && "$sshd" -t -f "$config"; then
+    for (( index = 0; index < ${#settings[@]}; index += 2 )); do
+      option="${settings[$index]}"
+      value="${settings[$((index + 1))]}"
+      key="${option,,}"
+      [[ "$key" != "challengeresponseauthentication" ]] || key="kbdinteractiveauthentication"
+      if [[ "$key" == "port" ]]; then
+        effective="$("$sshd" -T -f "$config" 2>/dev/null | awk '$1=="port" {print $2}' | paste -sd' ' -)"
+        [[ " ${effective} " == *" ${value} "* ]] || valid=0
+      else
+        effective="$("$sshd" -T -f "$config" 2>/dev/null | awk -v key="$key" '$1==key {print $2; exit}')"
+        [[ "${effective,,}" == "${value,,}" ]] || valid=0
+      fi
+      if (( valid == 0 )); then
+        error "${option} 最终生效值为 ${effective:-未知}，不是目标值 ${value}。"
+        break
+      fi
+    done
   else
-    error "SSH 配置语法校验失败，正在恢复。"
+    valid=0
+    error "SSH 配置写入或语法校验失败。"
   fi
 
+  if (( valid )) && reload_ssh_service; then
+    for (( index = 0; index < ${#settings[@]}; index += 2 )); do
+      if [[ "${settings[$index],,}" == "port" ]] && ! ssh_port_listening "${settings[$((index + 1))]}"; then
+        error "SSH 未实际监听目标端口 ${settings[$((index + 1))]}。"
+        valid=0
+        break
+      fi
+    done
+    if (( valid )); then
+      ok "SSH 配置已更新并生效：${SSHD_MANAGED_FILE}"
+      [[ -n "$backup" ]] && info "备份：${backup}"
+      return 0
+    fi
+  elif (( valid )); then
+    warn "配置校验通过，但 SSH 服务重载失败。"
+  fi
+
+  warn "SSH 修改未能完整生效，正在恢复。"
   if (( had_file )); then
     cp -a -- "$backup" "$SSHD_MANAGED_FILE"
   else
@@ -1196,6 +1349,10 @@ apply_sshd_option() {
   fi
   reload_ssh_service || true
   return 1
+}
+
+apply_sshd_option() {
+  apply_sshd_options "$1" "$2"
 }
 
 change_ssh_port() {
@@ -1220,20 +1377,34 @@ change_ssh_port() {
 }
 
 authorized_keys_present() {
-  local file
-  for file in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
-    [[ -s "$file" ]] && return 0
+  local file user shell permit_root="no"
+  permit_root="$("$(sshd_bin)" -T 2>/dev/null | awk '$1=="permitrootlogin" {print $2; exit}')"
+  if [[ -s /root/.ssh/authorized_keys && "$permit_root" != "no" ]]; then
+    return 0
+  fi
+  for file in /home/*/.ssh/authorized_keys; do
+    [[ -s "$file" ]] || continue
+    user="${file#/home/}"
+    user="${user%%/*}"
+    shell="$(getent passwd "$user" 2>/dev/null | awk -F: '{print $7}')"
+    case "$shell" in
+      ""|*/false|*/nologin) continue ;;
+      *) return 0 ;;
+    esac
   done
   return 1
 }
 
 disable_password_login() {
   if ! authorized_keys_present; then
-    error "未发现任何非空 authorized_keys，拒绝关闭密码登录，以免锁定 SSH。"
+    error "未发现允许登录账户的有效 authorized_keys，拒绝关闭密码登录，以免锁定 SSH。"
     return 1
   fi
   warn "关闭密码登录前，请保持当前会话，并另开窗口验证公钥登录。"
-  apply_sshd_option PasswordAuthentication no
+  apply_sshd_options \
+    PasswordAuthentication no \
+    KbdInteractiveAuthentication no \
+    ChallengeResponseAuthentication no
 }
 
 disable_root_login() {
@@ -1329,7 +1500,7 @@ enable_fail2ban() {
   info "将安装 Fail2ban，并保护当前 SSH TCP ${port}。"
   confirm "确认安装并启用 SSH 防暴力破解？" || return 0
   log_command interactive apt-get update || return 1
-  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban || return 1
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban python3-systemd || return 1
   install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")"
   if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
     install -d -m 0700 "$BACKUP_ROOT" || return 1
@@ -1432,11 +1603,14 @@ disable_auto_updates() {
   require_root
   warn "不会卸载 unattended-upgrades，只会关闭周期执行并删除脚本管理的附加选项。"
   confirm "确认关闭自动安全更新？" || return 0
+  backup_file "$AUTO_UPGRADES_FILE" || return 1
+  backup_file "$AUTO_UPGRADES_OPTIONS_FILE" || return 1
   {
     printf 'APT::Periodic::Update-Package-Lists "0";\n'
     printf 'APT::Periodic::Unattended-Upgrade "0";\n'
   } > "$AUTO_UPGRADES_FILE"
   rm -f "$AUTO_UPGRADES_OPTIONS_FILE"
+  chmod 0644 "$AUTO_UPGRADES_FILE"
   ok "自动安全更新周期已关闭。"
 }
 
@@ -1510,8 +1684,7 @@ check_service_access() {
     status="$(<"$temporary/$i")"
     printf '  %-10s %s\n' "${labels[$i]}" "${status:-检测失败}"
   done
-  rm -f -- "$temporary"/{0..5}
-  rmdir -- "$temporary" 2>/dev/null || true
+  rm -rf -- "$temporary"
   printf '\n结果只代表当前 VPS 的网络可达性，不代表账号、订阅或具体内容一定可用。\n'
 }
 
@@ -1947,7 +2120,7 @@ main() {
   case "$subcommand" in
     menu) main_menu ;;
     init) init_wizard ;;
-    status) show_status ;;
+    status) require_root; show_status ;;
     system) system_menu ;;
     ports) firewall_menu ;;
     swap) swap_menu ;;
