@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.4.3"
+VERSION="1.4.4"
 PROGRAM="vps-manager"
 SUPPORTED_UBUNTU_CODENAMES=(jammy noble questing resolute)
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
@@ -501,6 +501,8 @@ remove_managed_port() {
 }
 
 ensure_ufw() {
+  local simulation
+  local -a removals=()
   require_root
   require_ubuntu || return 1
   if command -v ufw >/dev/null 2>&1; then
@@ -509,7 +511,17 @@ ensure_ufw() {
   warn "当前未安装 ufw。"
   if confirm "是否安装 ufw？"; then
     acquire_lock || return 1
-    apt-get update && apt_install ufw
+    apt-get update || return 1
+    simulation="$(LC_ALL=C apt-get -s install ufw 2>&1)" || {
+      error "无法预演 UFW 安装，已停止操作。"
+      return 1
+    }
+    mapfile -t removals < <(awk '$1=="Remv" && !seen[$2]++ {print $2}' <<< "$simulation")
+    if (( ${#removals[@]} > 0 )); then
+      warn "APT 安装 UFW 将移除以下软件包：${removals[*]}"
+      confirm "确认接受以上软件包变更并继续？" || { info "已取消 UFW 安装。"; return 1; }
+    fi
+    apt_install ufw
     return $?
   fi
   return 1

@@ -1,6 +1,6 @@
 # mb-linux / vps-manager
 
-`vps-manager 1.4.3` 是面向个人 Ubuntu VPS 的中文交互式基础环境管理脚本，提供系统升级、SSH、UFW、Fail2ban、自动安全更新、BBR、Swap、Docker、DNS、状态检查和保守清理。
+`vps-manager 1.4.4` 是面向个人 Ubuntu VPS 的中文交互式基础环境管理脚本，提供系统升级、SSH、UFW、Fail2ban、自动安全更新、BBR、Swap、Docker、DNS、状态检查和保守清理。
 
 ## 支持范围
 
@@ -70,6 +70,7 @@ lm version              # 查看版本
 - 宽松模式关闭 UFW 并保留现有规则。
 - 收紧模式备份并重建 UFW，优先放行检测到的全部 SSH 端口；无法可靠识别 SSH 端口时拒绝执行。
 - 云厂商安全组需要单独配置。
+- 首次安装 UFW 前会预演 APT 变更；如果需要移除其他软件包，会显示清单并再次确认。
 - Docker 发布到公网的容器端口可能绕过 UFW；脚本只提示，不接管 `DOCKER-USER` 链。
 
 服务端口清单：
