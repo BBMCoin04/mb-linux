@@ -2,7 +2,7 @@
 # Bootstrap installer for vps-manager.
 set -uo pipefail
 umask 077
-VERSION="1.5.0"
+VERSION="1.5.1"
 DEFAULT_REPO="BBMCoin04/mb-linux"
 REPO="${VPS_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${VPS_MANAGER_REF:-main}"
@@ -80,7 +80,10 @@ installer_cleanup() {
 }
 
 installer_main() {
-  local command_name manager_version helper_version current_version="" index source_url helper_url
+  local command_name manager_version helper_version current_version="" index source_url helper_url online=0
+  if [[ "${1:-}" == --online ]]; then online=1; shift; fi
+  # Compatibility with the 1.5.0 updater, which passes explicit source URLs.
+  [[ -z "${VPS_MANAGER_SOURCE_URL:-}" ]] || online=1
   installer_require_root || { error "请使用 sudo bash install.sh。"; return 1; }
   for command_name in install bash mktemp flock stat sort timeout; do
     command -v "$command_name" >/dev/null 2>&1 || { error "缺少命令：${command_name}"; return 1; }
@@ -106,11 +109,16 @@ installer_main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   info "vps-manager ${VERSION} 安装器"
-  if trusted_bundle; then
+  if (( online == 0 )); then
+    trusted_bundle || {
+      error "本地源码不完整或权限不符合要求，已停止；不会自动下载远程版本。"
+      error "请一起保留三份脚本，并确保目录和脚本不可由其他用户或组写入。在线安装请明确添加 --online。"
+      return 1
+    }
     info "使用同目录的完整本地源码，不联网下载。"
     cp -- "$SCRIPT_DIR/vps-manager.sh" "$WORK_DIR/manager" && cp -- "$SCRIPT_DIR/network-rollback.sh" "$WORK_DIR/helper" || return 1
   else
-    info "下载同一仓库引用的程序和恢复程序（不使用公共临时目录中的旁置脚本）。"
+    info "在线安装：下载同一仓库引用的程序和恢复程序。"
     source_url="${VPS_MANAGER_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/vps-manager.sh}"
     helper_url="${VPS_MANAGER_ROLLBACK_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/network-rollback.sh}"
     fetch_source "$source_url" "$WORK_DIR/manager" && fetch_source "$helper_url" "$WORK_DIR/helper" || return 1

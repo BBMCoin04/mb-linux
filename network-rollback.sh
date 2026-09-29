@@ -3,7 +3,7 @@
 # This file is installed beside vps-manager as vps-manager.rollback.
 set -uo pipefail
 umask 077
-VERSION="1.5.0"
+VERSION="1.5.1"
 PROGRAM="vps-manager-network-rollback"
 
 restore_snapshot() {
@@ -29,13 +29,27 @@ private_guard_directory() {
 }
 
 rollback_main() {
-  local guard="${1:-}" kind state failed=0 target service socket_active ufw_status
+  local guard="${1:-}" kind state failed=0 target service socket_active ufw_status apply_unit load_state
   if [[ "$guard" == version ]]; then printf '%s %s\n' "$PROGRAM" "$VERSION"; return 0; fi
   rollback_require_root || { printf 'Rollback requires root.\n' >&2; return 1; }
   # Never source a state file. Values are data and paths remain quoted.
   private_guard_directory "$guard" || return 1
+  # The apply service owns all network writes. Stop its entire cgroup before
+  # taking the snapshot lock, so a stuck writer cannot prevent recovery.
+  exec >>"$guard/rollback.log" 2>&1
+  if [[ -f "$guard/apply-unit" ]]; then
+    apply_unit="$(<"$guard/apply-unit")"
+    [[ "$apply_unit" =~ ^vps-manager-apply-change\.[a-zA-Z0-9]+$ ]] || return 1
+    if ! timeout --kill-after=5s 20s systemctl stop "${apply_unit}.service"; then
+      load_state="$(timeout --kill-after=2s 5s systemctl show "${apply_unit}.service" --property=LoadState --value)" || load_state=""
+      if [[ "$load_state" != not-found ]]; then
+        printf 'Cannot stop network apply service; refusing concurrent restoration. Retry from the console.\n'
+        return 1
+      fi
+    fi
+  fi
   exec 8>"$guard/lock" || return 1
-  flock -x 8 || return 1
+  flock -w 15 -x 8 || { printf 'Cannot acquire recovery lock within 15 seconds.\n'; return 1; }
   state="$(<"$guard/state")"
   case "$state" in
     confirmed|rolled-back) return 0 ;;
@@ -44,7 +58,6 @@ rollback_main() {
   esac
   printf 'rolling-back\n' > "$guard/state" || return 1
   kind="$(<"$guard/kind")"
-  exec >>"$guard/rollback.log" 2>&1
   printf '[%s] Restoring %s configuration\n' "$(date -Is)" "$kind"
 
   case "$kind" in

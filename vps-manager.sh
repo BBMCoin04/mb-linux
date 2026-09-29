@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 PROGRAM="vps-manager"
 SUPPORTED_UBUNTU_CODENAMES=(jammy noble questing resolute)
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
@@ -27,7 +27,7 @@ SWAP_SYSCTL_FILE="/etc/sysctl.d/99-vps-manager-swap.conf"
 FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/vps-manager-sshd.local"
 SSHD_MANAGED_FILE="${VPS_MANAGER_SSHD_MANAGED_FILE:-/etc/ssh/sshd_config.d/00-vps-manager.conf}"
 CLOUD_HOSTNAME_FILE="${VPS_MANAGER_CLOUD_HOSTNAME_FILE:-/etc/cloud/cloud.cfg.d/99-vps-manager-hostname.cfg}"
-RESOLVED_CONFIG_FILE="${VPS_MANAGER_RESOLVED_CONFIG_FILE:-/etc/systemd/resolved.conf}"
+RESOLVED_CONFIG_FILE="${VPS_MANAGER_RESOLVED_CONFIG_FILE:-/etc/systemd/resolved.conf.d/99-vps-manager.conf}"
 RESOLV_CONF_FILE="${VPS_MANAGER_RESOLV_CONF_FILE:-/etc/resolv.conf}"
 APT_CONFIG_DIR="${VPS_MANAGER_APT_CONFIG_DIR:-/etc/apt/apt.conf.d}"
 AUTO_UPGRADES_FILE="${VPS_MANAGER_AUTO_UPGRADES_FILE:-${APT_CONFIG_DIR}/20auto-upgrades}"
@@ -36,6 +36,8 @@ APT_SOURCE_ROOT="${VPS_MANAGER_APT_SOURCE_ROOT:-/etc/apt}"
 DOCKER_KEY_FILE="${VPS_MANAGER_DOCKER_KEY_FILE:-${APT_SOURCE_ROOT}/keyrings/docker.asc}"
 DOCKER_SOURCE_FILE="${VPS_MANAGER_DOCKER_SOURCE_FILE:-${APT_SOURCE_ROOT}/sources.list.d/docker.sources}"
 ROLLBACK_HELPER="${VPS_MANAGER_ROLLBACK_HELPER:-${INSTALL_PATH}.rollback}"
+MANAGER_SOURCE="$(readlink -f -- "${BASH_SOURCE[0]}")"
+SSH_VERIFY_USER="${VPS_MANAGER_SSH_VERIFY_USER:-${SUDO_USER:-root}}"
 GUARD_ROOT="${VPS_MANAGER_GUARD_ROOT:-/var/lib/vps-manager/network-guard}"
 GUARD_TIMEOUT="${VPS_MANAGER_GUARD_TIMEOUT:-180}"
 ACTIVE_GUARD=""
@@ -140,7 +142,7 @@ start_network_guard() {
     command -v "$executable" >/dev/null 2>&1 || { error "缺少 ${executable}，不能安全安排超时恢复。"; return 1; }
   done
   [[ -f "$ROLLBACK_HELPER" && ! -L "$ROLLBACK_HELPER" ]] || {
-    error "缺少配套恢复程序，请先用 v1.5.0 安装器安装完整版本。"; return 1;
+    error "缺少配套恢复程序，请先用安装器安装完整版本。"; return 1;
   }
   [[ "$(bash "$ROLLBACK_HELPER" version)" == "vps-manager-network-rollback ${VERSION}" ]] || {
     error "恢复程序版本不匹配，请重新运行安装器。"; return 1;
@@ -162,6 +164,7 @@ start_network_guard() {
   unit="vps-manager-rollback-$(basename "$guard")"
   printf '%s\n' "$kind" > "$guard/kind" || return 1
   printf '%s\n' "$unit" > "$guard/unit" || return 1
+  printf 'vps-manager-apply-%s\n' "$(basename "$guard")" > "$guard/apply-unit" || return 1
   printf '%s\n' "$(( $(date +%s) + GUARD_TIMEOUT ))" > "$guard/deadline" || return 1
   printf '0\n' > "$guard/fail2ban-active" || return 1
   if systemctl is-active --quiet fail2ban 2>/dev/null; then
@@ -197,7 +200,8 @@ start_network_guard() {
     *) return 1 ;;
   esac
   cp -- "$ROLLBACK_HELPER" "$guard/rollback.sh" && chmod 0700 "$guard/rollback.sh" || return 1
-  bash -n "$guard/rollback.sh" || return 1
+  cp -- "$MANAGER_SOURCE" "$guard/manager.sh" && chmod 0700 "$guard/manager.sh" || return 1
+  bash -n "$guard/rollback.sh" && bash -n "$guard/manager.sh" || return 1
   exec 8>"$guard/lock" || return 1
   flock -x 8 || { exec 8>&-; return 1; }
   printf 'pending\n' > "$guard/state" || { exec 8>&-; return 1; }
@@ -217,7 +221,41 @@ start_network_guard() {
     abort_network_guard
     return 1
   fi
-  info "已安排 ${GUARD_TIMEOUT} 秒超时恢复；当前 SSH 会话断开也会执行。"
+  exec 8>&-
+  info "已安排 ${GUARD_TIMEOUT} 秒确认窗口；到期会先停止修改任务，再执行恢复。"
+}
+
+run_guarded_network_apply() {
+  local guard="$ACTIVE_GUARD" unit remaining
+  unit="$(<"$guard/apply-unit")"
+  remaining=$(( $(<"$guard/deadline") - $(date +%s) ))
+  (( remaining > 0 )) || return 1
+  systemd-run --quiet --collect --wait --pipe --unit="$unit" \
+    --property=Type=oneshot --property="TimeoutStartSec=${remaining}s" \
+    --property=TimeoutStopSec=10s --property=KillMode=control-group --property=SendSIGKILL=yes \
+    --setenv="LOG_ROOT=$LOG_ROOT" --setenv="VPS_MANAGER_BACKUP_ROOT=$BACKUP_ROOT" \
+    --setenv="VPS_MANAGER_CONFIG_ROOT=$CONFIG_ROOT" --setenv="VPS_MANAGER_PORT_CONFIG_FILE=$PORT_CONFIG_FILE" \
+    --setenv="VPS_MANAGER_SSHD_MANAGED_FILE=$SSHD_MANAGED_FILE" --setenv="VPS_MANAGER_SSH_VERIFY_USER=$SSH_VERIFY_USER" \
+    --setenv="SSH_CONNECTION=${SSH_CONNECTION:-}" \
+    /bin/bash "$guard/manager.sh" _network-apply "$guard" "$@"
+}
+
+network_apply_main() {
+  local guard="${1:-}" kind="${2:-}"
+  require_root
+  [[ "$guard" == /* && -d "$guard" && ! -L "$guard" ]] || return 1
+  [[ "$(stat -c %u "$guard")" == 0 && "$(stat -c %a "$guard")" == 700 ]] || return 1
+  shift 2
+  exec 8>"$guard/lock" || return 1
+  flock -w 10 -x 8 || return 1
+  [[ "$(<"$guard/state")" == pending ]] || return 1
+  (( $(date +%s) < $(<"$guard/deadline") )) || return 1
+  case "$kind" in
+    ssh) network_apply_ssh "$guard/ssh-candidate" "$@" || return 1 ;;
+    ufw) network_apply_ufw "$@" || return 1 ;;
+    *) return 1 ;;
+  esac
+  : > "$guard/applied"
 }
 
 abort_network_guard() {
@@ -239,12 +277,17 @@ abort_network_guard() {
 commit_network_guard() {
   local guard="$1" unit state
   exec 8>"$guard/lock" || return 1
-  flock -x 8 || { exec 8>&-; return 1; }
+  flock -w 10 -x 8 || { exec 8>&-; return 1; }
   state="$(<"$guard/state")"
   if [[ "$state" != pending ]]; then
     exec 8>&-
     [[ "$state" == confirmed ]] && return 0
     error "本次修改已开始恢复或恢复失败，不能再确认保留。"
+    return 1
+  fi
+  if [[ -f "$guard/apply-unit" && ! -f "$guard/applied" ]]; then
+    exec 8>&-
+    error "网络修改尚未通过全部检查，不能提前确认保留。"
     return 1
   fi
   if (( $(date +%s) >= $(<"$guard/deadline") )); then
@@ -313,6 +356,18 @@ validate_manager_paths() {
 }
 
 acquire_lock() {
+  local pending_guard pending_state
+  if [[ -z "$ACTIVE_GUARD" && -f "$GUARD_ROOT/current" ]]; then
+    pending_guard="$(<"$GUARD_ROOT/current")"
+    if [[ "$pending_guard" == "$GUARD_ROOT"/change.* && -f "$pending_guard/state" ]]; then
+      pending_state="$(<"$pending_guard/state")"
+      case "$pending_state" in
+        pending|rolling-back|rollback-failed)
+          error "网络修改仍待确认或恢复（${pending_state}），请先处理后再执行其他修改。"
+          return 1 ;;
+      esac
+    fi
+  fi
   (( LOCK_HELD == 0 )) || return 0
   ensure_directories || return 1
   if [[ "$(readlink /proc/self/fd/9 2>/dev/null || true)" != "$LOCK_FILE" ]]; then
@@ -469,6 +524,7 @@ ${PROGRAM} ${VERSION}
   lm                       快捷打开交互菜单
   ${PROGRAM} init         进入基础初始化向导
   ${PROGRAM} status       查看系统、SSH、防火墙、BBR、DNS、IP 状态
+  ${PROGRAM} system       进入系统升级、主机名与时区菜单
   ${PROGRAM} ports        管理防火墙模式和端口
   ${PROGRAM} swap         进入 Swap 管理
   ${PROGRAM} security     进入 Fail2ban 与自动安全更新
@@ -550,7 +606,7 @@ install_common_dependencies() {
   acquire_lock || return 1
   info "准备安装常用依赖：${COMMON_PACKAGES[*]}"
   log_command interactive apt-get update || return 1
-  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y "${COMMON_PACKAGES[@]}"
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y "${COMMON_PACKAGES[@]}"
 }
 
 show_hostname() {
@@ -918,23 +974,6 @@ close_managed_port() {
   show_port_details "$rule"
 }
 
-restore_ufw_backup() {
-  local backup_dir="$1" was_active="$2" failed=0
-  [[ -d "$backup_dir/ufw" ]] || return 1
-  cp -a -- "$backup_dir/ufw/." /etc/ufw/ 2>/dev/null || failed=1
-  if [[ -f "$backup_dir/default-ufw" ]]; then
-    install -m 0644 "$backup_dir/default-ufw" /etc/default/ufw 2>/dev/null || failed=1
-  fi
-  if (( was_active )); then
-    ufw --force enable >/dev/null 2>&1 || failed=1
-    ufw_is_active || failed=1
-  else
-    ufw disable >/dev/null 2>&1 || failed=1
-    ufw_is_active && failed=1
-  fi
-  (( failed == 0 ))
-}
-
 set_firewall_relaxed() {
   require_root
   require_ubuntu || return 1
@@ -955,7 +994,7 @@ set_firewall_relaxed() {
 }
 
 set_firewall_tight() {
-  local ssh_ports backup_dir rule failed=0 docker_was_active=0
+  local ssh_ports backup_dir docker_was_active=0
   require_root
   require_ubuntu || return 1
   ensure_ufw || return 1
@@ -983,9 +1022,32 @@ set_firewall_tight() {
   [[ ! -f /etc/default/ufw ]] || cp -a -- /etc/default/ufw "$backup_dir/default-ufw" || return 1
 
   start_network_guard ufw || return 1
+  if ! run_guarded_network_apply ufw "${PORT_RULES[@]}"; then
+    error "收紧模式应用失败或超时，正在恢复。"
+    abort_network_guard
+    show_firewall_status
+    return 1
+  fi
+  finish_network_guard || return 1
+  ok "已切换到收紧模式，当前 SSH 端口均保持放行。"
+  info "UFW 备份：${backup_dir}"
+  if (( docker_was_active )); then
+    warn "检测到 Docker 正在运行；UFW 重建可能影响容器 NAT 或端口发布规则。"
+    if confirm "是否现在重启 Docker 以重建网络规则？"; then
+      systemctl restart docker || warn "Docker 重启失败，请立即检查容器网络。"
+    fi
+  fi
+  log_line "firewall mode changed to tight: ${PORT_RULES[*]}"
+  show_firewall_status
+}
+
+network_apply_ufw() {
+  local rule failed=0
+  PORT_RULES=("$@")
+  (( ${#PORT_RULES[@]} > 0 )) || return 1
+  load_managed_service_ports
   if [[ ! -f "$PORT_CONFIG_FILE" ]] && ! save_managed_service_ports; then
     error "无法保存收紧模式端口清单。"
-    abort_network_guard
     return 1
   fi
   log_command quiet timeout 35s ufw --force reset || failed=1
@@ -1010,23 +1072,7 @@ set_firewall_tight() {
     timeout 35s fail2ban-client reload --restart || failed=1
   fi
 
-  if (( failed )); then
-    error "收紧模式应用或运行检查失败，正在恢复。"
-    abort_network_guard
-    show_firewall_status
-    return 1
-  fi
-  finish_network_guard || return 1
-  ok "已切换到收紧模式，当前 SSH 端口均保持放行。"
-  info "UFW 备份：${backup_dir}"
-  if (( docker_was_active )); then
-    warn "检测到 Docker 正在运行；UFW 重建可能影响容器 NAT 或端口发布规则。"
-    if confirm "是否现在重启 Docker 以重建网络规则？"; then
-      systemctl restart docker || warn "Docker 重启失败，请立即检查容器网络。"
-    fi
-  fi
-  log_line "firewall mode changed to tight: ${PORT_RULES[*]}"
-  show_firewall_status
+  (( failed == 0 ))
 }
 
 firewall_menu() {
@@ -1073,7 +1119,9 @@ enable_bbr() {
   require_root
   require_ubuntu || return 1
   acquire_lock || return 1
-  local available temporary backup=""
+  local available temporary backup="" previous_cc previous_qdisc failed=0
+  previous_cc="$(sysctl -n net.ipv4.tcp_congestion_control)" || return 1
+  previous_qdisc="$(sysctl -n net.core.default_qdisc)" || return 1
   modprobe tcp_bbr 2>/dev/null || true
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
   if [[ "$available" != *bbr* ]]; then
@@ -1095,48 +1143,40 @@ enable_bbr() {
     return 1
   fi
   rm -f -- "$temporary"
-  if log_command interactive sysctl --system; then
+  if log_command interactive sysctl -p /etc/sysctl.d/99-vps-manager-bbr.conf &&
+     [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == bbr && "$(sysctl -n net.core.default_qdisc)" == fq ]]; then
     rm -f -- "$backup"
-    ok "BBR 配置已写入 /etc/sysctl.d/99-vps-manager-bbr.conf"
+    ok "BBR 配置已写入并即时生效，不需要重启。"
     bbr_status
-    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
-      ok "BBR 已即时生效，不需要重启。"
-    elif reboot_required; then
-      offer_reboot "BBR 配置已写入，但系统同时标记为需要重启。"
-    fi
   else
     if [[ -n "$backup" ]]; then
-      atomic_install_file "$backup" /etc/sysctl.d/99-vps-manager-bbr.conf 0644 || true
+      atomic_install_file "$backup" /etc/sysctl.d/99-vps-manager-bbr.conf 0644 || failed=1
     else
-      rm -f -- /etc/sysctl.d/99-vps-manager-bbr.conf
+      rm -f -- /etc/sysctl.d/99-vps-manager-bbr.conf || failed=1
     fi
     rm -f -- "$backup"
-    log_command quiet sysctl --system || true
-    error "应用 sysctl 配置失败，已恢复原配置。"
+    log_command quiet sysctl -w "net.ipv4.tcp_congestion_control=$previous_cc" || failed=1
+    log_command quiet sysctl -w "net.core.default_qdisc=$previous_qdisc" || failed=1
+    if (( failed )); then
+      error "BBR 应用失败，且原配置或运行值恢复不完整，请检查日志。"
+    else
+      error "BBR 应用失败，已恢复原配置和修改前的内核运行值。"
+    fi
     return 1
   fi
 }
 
 disable_bbr() {
-  local backup
   require_root
   require_ubuntu || return 1
   [[ -f /etc/sysctl.d/99-vps-manager-bbr.conf ]] || { info "vps-manager 没有创建 BBR 配置。"; return 0; }
-  warn "只会删除 vps-manager 创建的 BBR sysctl 文件。"
-  confirm "确认移除 BBR 配置？" || return 0
+  warn "仅移除本工具的持久配置，当前连接和当前拥塞算法不切换；重启后按系统配置加载。"
+  confirm "确认移除 BBR 持久配置？" || return 0
   acquire_lock || return 1
-  backup="$(mktemp /tmp/vps-manager-bbr-original.XXXXXX)" || return 1
-  cp -a -- /etc/sysctl.d/99-vps-manager-bbr.conf "$backup" || { rm -f -- "$backup"; return 1; }
-  rm -f -- /etc/sysctl.d/99-vps-manager-bbr.conf
-  if ! log_command quiet sysctl --system; then
-    atomic_install_file "$backup" /etc/sysctl.d/99-vps-manager-bbr.conf 0644 || true
-    rm -f -- "$backup"
-    log_command quiet sysctl --system || true
-    error "重新加载 sysctl 失败，已恢复 BBR 配置。"
-    return 1
-  fi
-  rm -f -- "$backup"
-  ok "已移除 vps-manager 的 BBR 配置，系统已重新加载现有 sysctl。"
+  backup_file /etc/sysctl.d/99-vps-manager-bbr.conf || return 1
+  rm -f -- /etc/sysctl.d/99-vps-manager-bbr.conf || return 1
+  ok "已移除本工具的 BBR 持久配置。"
+  bbr_status
 }
 
 bbr_menu() {
@@ -1145,7 +1185,7 @@ bbr_menu() {
     printf '\nBBR 与网络优化：\n'
     printf '  1. 查看 BBR 状态\n'
     printf '  2. 启用 BBR\n'
-    printf '  3. 移除 vps-manager 的 BBR 配置\n'
+    printf '  3. 移除 BBR 持久配置（不切换当前算法）\n'
     printf '  0. 返回\n'
     read -r -p "请选择：" choice || return 0
     case "$choice" in
@@ -1454,24 +1494,11 @@ show_dns_status() {
   sed -n '1,20p' "$RESOLV_CONF_FILE" 2>/dev/null || true
 }
 
-set_resolved_key() {
-  local file="$1" key="$2" value="$3"
-  touch "$file"
-  if ! grep -q '^\[Resolve\]' "$file"; then
-    printf '\n[Resolve]\n' >> "$file"
-  fi
-  if grep -qiE "^[#[:space:]]*${key}=" "$file"; then
-    sed -i -E "s|^[#[:space:]]*${key}=.*|${key}=${value}|I" "$file"
-  else
-    printf '%s=%s\n' "$key" "$value" >> "$file"
-  fi
-}
-
 systemd_resolved_manages_dns() {
   local target
   command -v systemctl >/dev/null 2>&1 || return 1
   systemctl is-active --quiet systemd-resolved 2>/dev/null || return 1
-  [[ -f "$RESOLVED_CONFIG_FILE" ]] || return 1
+  [[ "$RESOLVED_CONFIG_FILE" == /* ]] || return 1
   target="$(readlink -f "$RESOLV_CONF_FILE" 2>/dev/null || true)"
   case "$target" in
     /run/systemd/resolve/resolv.conf|/run/systemd/resolve/stub-resolv.conf) return 0 ;;
@@ -1492,20 +1519,36 @@ dns_resolution_works() {
   return 1
 }
 
-configured_dns_works() {
-  local dns_addresses="$1" server answer host
-  for server in $dns_addresses; do
-    for host in ubuntu.com cloudflare.com; do
-      answer="$(timeout 7s dig +time=2 +tries=1 +short "@${server}" "$host" A 2>/dev/null)" || continue
-      if grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<< "$answer"; then return 0; fi
-    done
+dns_server_works() {
+  local server="$1" answer host
+  for host in ubuntu.com cloudflare.com; do
+    answer="$(timeout 7s dig +time=2 +tries=1 +short "@${server}" "$host" A 2>/dev/null)" || continue
+    if grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<< "$answer"; then return 0; fi
   done
   return 1
 }
 
+configured_dns_works() {
+  local dns_addresses="$1" server count=0
+  for server in $dns_addresses; do
+    count=$((count+1))
+    dns_server_works "$server" || { error "主 DNS ${server} 未通过直接解析检查。"; return 1; }
+  done
+  (( count > 0 ))
+}
+
+resolved_global_dns_matches() {
+  local expected="$1" actual server
+  actual="$(LC_ALL=C resolvectl dns 2>/dev/null)" || return 1
+  actual="$(awk '/^Global:/ {$1=""; print; exit}' <<< "$actual")"
+  for server in $expected; do
+    [[ " ${actual,,} " == *" ${server,,} "* ]] || return 1
+  done
+}
+
 apply_dns_servers() {
   local label="$1" dns="$2" fallback="$3" resolved_file="$RESOLVED_CONFIG_FILE"
-  local rollback rollback_dir temporary candidate server
+  local rollback rollback_dir temporary candidate server had_resolved=0
   local -a dns_servers=() fallback_servers=() all_servers=()
   require_root
   require_ubuntu || return 1
@@ -1520,29 +1563,40 @@ apply_dns_servers() {
   acquire_lock || return 1
   ensure_command dig dnsutils || return 1
   info "先直接查询你指定的 DNS，避免旧缓存造成误判。"
-  configured_dns_works "${dns} ${fallback}" || { error "指定 DNS 未通过直接解析测试，原配置未修改。"; return 1; }
+  configured_dns_works "$dns" || { error "主 DNS 未全部通过检查，原配置未修改。"; return 1; }
+  for server in $fallback; do
+    dns_server_works "$server" || warn "备用 DNS ${server} 当前不可达；它不会用于代替主 DNS 的检查。"
+  done
 
   if systemd_resolved_manages_dns; then
+    [[ ! -L "$resolved_file" && ( ! -e "$resolved_file" || -f "$resolved_file" ) ]] || {
+      error "DNS 管理配置不是普通文件，停止修改。"; return 1;
+    }
+    install -d -m 0755 "$(dirname "$resolved_file")" || return 1
     rollback="$(mktemp /tmp/vps-manager-resolved-old.XXXXXX)" || return 1
     candidate="$(mktemp /tmp/vps-manager-resolved-new.XXXXXX)" || { rm -f -- "$rollback"; return 1; }
-    cp -a -- "$resolved_file" "$rollback" || { rm -f -- "$rollback" "$candidate"; return 1; }
-    cp -a -- "$resolved_file" "$candidate" || { rm -f -- "$rollback" "$candidate"; return 1; }
+    if [[ -f "$resolved_file" ]]; then
+      cp -a -- "$resolved_file" "$rollback" || { rm -f -- "$rollback" "$candidate"; return 1; }
+      had_resolved=1
+    fi
     backup_file "$resolved_file" || { rm -f -- "$rollback" "$candidate"; return 1; }
-    if set_resolved_key "$candidate" DNS "$dns" &&
-       set_resolved_key "$candidate" FallbackDNS "$fallback" &&
+    # Clear inherited global lists before specifying our values. Per-link DNS
+    # remains under the network manager's control and is displayed below.
+    if printf '[Resolve]\nDNS=\nDNS=%s\nFallbackDNS=\nFallbackDNS=%s\n' "$dns" "$fallback" > "$candidate" &&
        atomic_install_file "$candidate" "$resolved_file" 0644 &&
-       systemctl restart systemd-resolved && dns_resolution_works; then
+       timeout --kill-after=5s 35s systemctl restart systemd-resolved &&
+       resolved_global_dns_matches "$dns" && dns_resolution_works; then
       rm -f -- "$rollback" "$candidate"
-      ok "systemd-resolved 配置已更新，指定 DNS 与系统解析测试通过。"
-      info "接口级 DHCP / netplan DNS 仍可能参与解析，请结合下方状态确认。"
+      ok "DNS 配置已更新，主 DNS 直连检查、全局生效值及系统解析均通过。"
+      info "接口级 DHCP / netplan DNS 仍可能参与解析；FallbackDNS 仅在无其他 DNS 配置信息时使用，不是超时切换。"
       show_dns_status
       return 0
     fi
-    if ! atomic_install_file "$rollback" "$resolved_file" 0644; then
+    if ! restore_file_snapshot "$rollback" "$had_resolved" "$resolved_file"; then
       error "DNS 配置失败且原配置恢复失败，请立即通过控制台检查 ${resolved_file}。"
     fi
     rm -f -- "$rollback" "$candidate"
-    systemctl restart systemd-resolved >/dev/null 2>&1 || true
+    timeout --kill-after=5s 35s systemctl restart systemd-resolved >/dev/null 2>&1 || true
     error "DNS 配置未通过应用或解析测试，已尝试恢复原配置。"
     return 1
   fi
@@ -1559,6 +1613,8 @@ apply_dns_servers() {
   all_servers=("${dns_servers[@]}" "${fallback_servers[@]}")
   {
     printf '# Managed by vps-manager on %s\n' "$(date '+%F %T %z')"
+    # Preserve search domains and resolver options from the previous file.
+    awk '$1=="search" || $1=="domain" || $1=="options"' "$RESOLV_CONF_FILE"
     for server in "${all_servers[@]}"; do
       [[ -z "$server" ]] || printf 'nameserver %s\n' "$server"
     done
@@ -1777,14 +1833,68 @@ apply_sshd_options() {
 }
 
 apply_ssh_candidate() {
-  local candidate="$1" mode="$2" config sshd effective key value index valid=1
+  local candidate="$1" mode="$2"
+  shift 2
+  backup_file "$SSHD_MANAGED_FILE" || { rm -f -- "$candidate"; return 1; }
+  start_network_guard ssh || { rm -f -- "$candidate"; return 1; }
+  if ! cp -- "$candidate" "$ACTIVE_GUARD/ssh-candidate"; then
+    rm -f -- "$candidate"
+    abort_network_guard
+    return 1
+  fi
+  rm -f -- "$candidate"
+  if ! run_guarded_network_apply ssh "$mode" "$@"; then
+    error "SSH 修改任务失败或超时，正在恢复。"
+    abort_network_guard
+    return 1
+  fi
+  ok "本机检查通过；请从新窗口验证 SSH 登录。"
+  finish_network_guard
+}
+
+ssh_options_match() {
+  local effective="$1" key value index
+  shift
+  local -a expected=("$@")
+  for (( index=0; index<${#expected[@]}; index+=2 )); do
+    key="${expected[$index],,}"; value="${expected[$((index+1))]}"
+    [[ "$key" != challengeresponseauthentication ]] || key=kbdinteractiveauthentication
+    [[ "$(awk -v key="$key" '$1==key {print $2; exit}' <<< "$effective")" == "$value" ]] || return 1
+  done
+}
+
+verify_ssh_connection_options() {
+  local sshd="$1" config="$2" remote_ip remote_port local_ip local_port user effective context
+  shift 2
+  if [[ -z "${SSH_CONNECTION:-}" ]]; then
+    warn "未取得当前 SSH 连接地址；本次仅核对全局设置，其他 Match 条件须用对应账号和来源验证。"
+    return 0
+  fi
+  read -r remote_ip remote_port local_ip local_port <<< "$SSH_CONNECTION"
+  [[ "$remote_port" =~ ^[0-9]{1,5}$ && "$local_port" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$remote_port >= 1 && 10#$remote_port <= 65535 && 10#$local_port >= 1 && 10#$local_port <= 65535 )) || return 1
+  validate_ipv4 "$remote_ip" || validate_ipv6 "$remote_ip" || return 1
+  validate_ipv4 "$local_ip" || validate_ipv6 "$local_ip" || return 1
+  for user in root "$SSH_VERIFY_USER"; do
+    [[ "$user" != *[,$'\n']* && -n "$user" ]] || return 1
+    # Match Host may depend on reverse DNS. Do not invent a hostname: verify
+    # the known numeric connection context and explain the remaining scope.
+    context="user=${user},addr=${remote_ip},host=${remote_ip},laddr=${local_ip},lport=${local_port}"
+    effective="$("$sshd" -T -f "$config" -C "$context" 2>/dev/null)" || return 1
+    ssh_options_match "$effective" "$@" || {
+      error "${user} 在当前连接条件下的 SSH 策略被 Match 配置覆盖。"
+      return 1
+    }
+  done
+  info "已核对全局及当前来源的用户策略；其他来源、用户与 Match Host 规则仍需另行登录验证。"
+}
+
+network_apply_ssh() {
+  local candidate="$1" mode="$2" config sshd effective value valid=1
   shift 2
   local -a expected=("$@")
   config="$(sshd_config_file)"; sshd="$(sshd_bin)"
-  backup_file "$SSHD_MANAGED_FILE" || { rm -f -- "$candidate"; return 1; }
-  start_network_guard ssh || { rm -f -- "$candidate"; return 1; }
   atomic_install_file "$candidate" "$SSHD_MANAGED_FILE" 0644 || valid=0
-  rm -f -- "$candidate"
   if (( valid )); then "$sshd" -t -f "$config" || valid=0; fi
   if (( valid )); then
     effective="$("$sshd" -T -f "$config" 2>/dev/null)" || valid=0
@@ -1793,11 +1903,8 @@ apply_ssh_candidate() {
         awk -v value="$value" '$1=="port" && $2==value {found=1} END {exit !found}' <<< "$effective" || valid=0
       done
     else
-      for (( index=0; index<${#expected[@]}; index+=2 )); do
-        key="${expected[$index],,}"; value="${expected[$((index+1))]}"
-        [[ "$key" != challengeresponseauthentication ]] || key=kbdinteractiveauthentication
-        [[ "$(awk -v key="$key" '$1==key {print $2; exit}' <<< "$effective")" == "$value" ]] || valid=0
-      done
+      ssh_options_match "$effective" "${expected[@]}" || valid=0
+      if (( valid )); then verify_ssh_connection_options "$sshd" "$config" "${expected[@]}" || valid=0; fi
     fi
   fi
   if (( valid )); then reload_ssh_service || valid=0; fi
@@ -1812,12 +1919,9 @@ apply_ssh_candidate() {
     fi
   fi
   if (( valid == 0 )); then
-    error "SSH 配置、实际监听或 Fail2ban 配套检查未通过，正在恢复。"
-    abort_network_guard
+    error "SSH 配置、实际监听或 Fail2ban 配套检查未通过。"
     return 1
   fi
-  ok "本机检查通过；请从新窗口验证 SSH 登录。"
-  finish_network_guard
 }
 
 apply_sshd_option() {
@@ -2409,7 +2513,7 @@ enable_auto_updates() {
   acquire_lock || return 1
   relocate_legacy_apt_backups || { error "迁移旧版 APT 备份失败，已停止配置。"; return 1; }
   log_command interactive apt-get update || return 1
-  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades || return 1
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y unattended-upgrades || return 1
 
   periodic_tmp="$(mktemp /tmp/vps-manager-auto-periodic.XXXXXX)" || return 1
   options_tmp="$(mktemp /tmp/vps-manager-auto-options.XXXXXX)" || { rm -f -- "$periodic_tmp"; return 1; }
@@ -2536,9 +2640,15 @@ http_access_status() {
   code="$(curl -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' \
     -sS -L --connect-timeout 4 -m 10 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
   case "$code" in
-    2??|3??|400|401|404|405|409|422|429) printf '可以访问' ;;
-    403|451) printf '不可访问' ;;
-    *) printf '检测失败' ;;
+    2??) printf 'HTTP 可达' ;;
+    3??) printf '重定向未完成' ;;
+    401) printf '接口可达，需要认证' ;;
+    403) printf '访问受限（HTTP 403）' ;;
+    429) printf '请求受限（HTTP 429）' ;;
+    451) printf '访问受限（HTTP 451）' ;;
+    4??) printf '请求未成功（HTTP %s）' "$code" ;;
+    5??) printf '服务端异常（HTTP %s）' "$code" ;;
+    *) printf '连接或解析失败' ;;
   esac
 }
 
@@ -2689,12 +2799,12 @@ install_docker_official() {
   fi
 
   log_command interactive apt-get update || return 1
-  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl || return 1
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y ca-certificates curl || return 1
 
   if [[ -n "$existing_source" && "$existing_source" != "$DOCKER_SOURCE_FILE" ]]; then
     reuse_existing=1
     info "检测到现有 Docker 官方源，将原样复用，不创建重复源：${existing_source}"
-    if log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install --download-only -y "${docker_packages[@]}"; then
+    if log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install --download-only -y "${docker_packages[@]}"; then
       repo_ready=1
     fi
   else
@@ -2729,7 +2839,7 @@ install_docker_official() {
     (( rc )) || atomic_install_file "$key_candidate" "$DOCKER_KEY_FILE" 0644 || rc=1
     (( rc )) || atomic_install_file "$source_candidate" "$DOCKER_SOURCE_FILE" 0644 || rc=1
     if (( rc == 0 )) && log_command interactive apt-get update &&
-       log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install --download-only -y "${docker_packages[@]}"; then
+       log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install --download-only -y "${docker_packages[@]}"; then
       repo_ready=1
     fi
     rm -f -- "$key_candidate" "$source_candidate"
@@ -2776,9 +2886,9 @@ install_docker_official() {
     rm -f -- "$key_snapshot" "$source_snapshot"
   fi
   if (( ${#conflicts[@]} > 0 )); then
-    log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get remove -y "${conflicts[@]}" || return 1
+    log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 remove -y "${conflicts[@]}" || return 1
   fi
-  if ! log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y "${docker_packages[@]}"; then
+  if ! log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y "${docker_packages[@]}"; then
     error "Docker 安装失败；有效仓库与已下载包仍保留，可修复 APT/dpkg 后重新运行本操作。"
     return 1
   fi
@@ -2806,15 +2916,6 @@ add_user_to_docker_group() {
   ok "${username} 已加入 docker 组；需要重新登录后生效。"
 }
 
-test_docker() {
-  require_root
-  require_ubuntu || return 1
-  command -v docker >/dev/null 2>&1 || { error "Docker 尚未安装。"; return 1; }
-  warn "测试会从 Docker Hub 拉取 hello-world 镜像并运行一次。"
-  confirm "确认运行 Docker 测试？" || return 0
-  log_command interactive docker run --rm hello-world
-}
-
 docker_menu() {
   local choice
   require_root
@@ -2823,14 +2924,12 @@ docker_menu() {
     printf '  1. 查看 Docker 状态\n'
     printf '  2. 按官方 Ubuntu 流程安装/更新 Docker\n'
     printf '  3. 将现有用户加入 docker 组\n'
-    printf '  4. 运行 hello-world 测试\n'
     printf '  0. 返回\n'
     read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) show_docker_status; pause ;;
       2) install_docker_official; pause ;;
       3) add_user_to_docker_group; pause ;;
-      4) test_docker; pause ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -3049,7 +3148,7 @@ update_manager() {
     VPS_MANAGER_SOURCE_URL="$source_url" VPS_MANAGER_ROLLBACK_SOURCE_URL="$helper_url" \
     VPS_MANAGER_INSTALL_PATH="$INSTALL_PATH" VPS_MANAGER_ROLLBACK_HELPER="$ROLLBACK_HELPER" \
     VPS_MANAGER_ALIAS_PATH="$ALIAS_PATH" VPS_MANAGER_LOCK_FILE="$LOCK_FILE" \
-    bash "$installer" version
+    bash "$installer" --online version
   rc=$?
   rm -f -- "$installer"
   if (( rc != 0 )); then
@@ -3131,6 +3230,7 @@ main() {
     cleanup-system) safe_system_cleanup ;;
     update|update-manager) update_manager ;;
     confirm-network) confirm_pending_network ;;
+    _network-apply) shift; network_apply_main "$@" ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|--help|-h) show_help ;;
     *) error "未知命令：${subcommand}"; show_help; return 2 ;;
