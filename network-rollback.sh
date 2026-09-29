@@ -3,7 +3,7 @@
 # This file is installed beside vps-manager as vps-manager.rollback.
 set -uo pipefail
 umask 077
-VERSION="1.5.1"
+VERSION="1.5.2"
 PROGRAM="vps-manager-network-rollback"
 
 restore_snapshot() {
@@ -29,23 +29,33 @@ private_guard_directory() {
 }
 
 rollback_main() {
-  local guard="${1:-}" kind state failed=0 target service socket_active ufw_status apply_unit load_state
+  local guard="${1:-}" kind state failed=0 target service socket_active ufw_status apply_unit load_state stop_details
   if [[ "$guard" == version ]]; then printf '%s %s\n' "$PROGRAM" "$VERSION"; return 0; fi
   rollback_require_root || { printf 'Rollback requires root.\n' >&2; return 1; }
   # Never source a state file. Values are data and paths remain quoted.
   private_guard_directory "$guard" || return 1
+  [[ -r "$guard/state" ]] || return 1
+  state="$(<"$guard/state")"
+  # Terminal states never become pending again. A late timer or repeated
+  # foreground request has nothing left to stop or restore.
+  case "$state" in
+    confirmed|rolled-back) return 0 ;;
+  esac
   # The apply service owns all network writes. Stop its entire cgroup before
   # taking the snapshot lock, so a stuck writer cannot prevent recovery.
   exec >>"$guard/rollback.log" 2>&1
   if [[ -f "$guard/apply-unit" ]]; then
     apply_unit="$(<"$guard/apply-unit")"
     [[ "$apply_unit" =~ ^vps-manager-apply-change\.[a-zA-Z0-9]+$ ]] || return 1
-    if ! timeout --kill-after=5s 20s systemctl stop "${apply_unit}.service"; then
+    if ! stop_details="$(timeout --kill-after=5s 20s systemctl stop "${apply_unit}.service" 2>&1)"; then
       load_state="$(timeout --kill-after=2s 5s systemctl show "${apply_unit}.service" --property=LoadState --value)" || load_state=""
       if [[ "$load_state" != not-found ]]; then
+        [[ -z "$stop_details" ]] || printf '%s\n' "$stop_details"
         printf 'Cannot stop network apply service; refusing concurrent restoration. Retry from the console.\n'
         return 1
       fi
+      # --collect removes a successfully completed apply service. Its absence
+      # is expected here; only suppress the captured stop error in this case.
     fi
   fi
   exec 8>"$guard/lock" || return 1

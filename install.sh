@@ -2,7 +2,7 @@
 # Bootstrap installer for vps-manager.
 set -uo pipefail
 umask 077
-VERSION="1.5.1"
+VERSION="1.5.2"
 DEFAULT_REPO="BBMCoin04/mb-linux"
 REPO="${VPS_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${VPS_MANAGER_REF:-main}"

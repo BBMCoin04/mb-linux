@@ -1,4 +1,4 @@
-# MB-Linux / vps-manager 1.5.1
+# MB-Linux / vps-manager 1.5.2
 
 中文 Ubuntu VPS 管理工具，快捷命令 **`lm`**。提供系统升级、SSH、防火墙、Fail2ban、自动安全更新、BBR、Swap、Docker、DNS、访问检测和保守清理。
 
@@ -55,7 +55,7 @@ chmod go-w . install.sh vps-manager.sh network-rollback.sh
 lm version
 ```
 
-预期输出 `vps-manager 1.5.1`。程序位于 `/usr/local/sbin/vps-manager`，快捷命令为 `/usr/local/sbin/lm`，恢复程序为 `/usr/local/sbin/vps-manager.rollback`。安装器不覆盖其他程序占用的 `lm`，也不允许用旧版本覆盖新版。
+预期输出 `vps-manager 1.5.2`。程序位于 `/usr/local/sbin/vps-manager`，快捷命令为 `/usr/local/sbin/lm`，恢复程序为 `/usr/local/sbin/vps-manager.rollback`。安装器不覆盖其他程序占用的 `lm`，也不允许用旧版本覆盖新版。
 
 ## 常用入口
 
@@ -135,6 +135,8 @@ sudo bash /var/lib/vps-manager/network-guard/change.XXXXXXXX/rollback.sh /var/li
 普通备份在 `/var/backups/vps-manager/`，操作日志在 `/var/log/vps-manager/vps-manager.log`。
 
 ## 本地维护与上传 GitHub
+
+1.5.2 修正恢复日志：已正常结束并被 systemd 回收的修改任务不再显示 `Unit ... not loaded`；已确认或已恢复的事务直接结束重复请求。真正的停止失败仍会记录原因并阻止并发恢复。功能和菜单与 1.5.1 一致。
 
 先在本地保存完整源码，再将本目录中的文件一起提交到 `BBMCoin04/mb-linux` 的 `main` 分支。仓库根目录应直接看到 `install.sh`，不要再套一层文件夹。在线安装和菜单更新取 GitHub 内容，尚未上传时可直接使用本地安装。
 

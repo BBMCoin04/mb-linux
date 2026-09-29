@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 PROGRAM="vps-manager"
 SUPPORTED_UBUNTU_CODENAMES=(jammy noble questing resolute)
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
