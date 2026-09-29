@@ -1,0 +1,35 @@
+name: Validate source
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax, regression tests and ShellCheck
+        run: bash scripts/check.sh
+
+  fail2ban-parser:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out upstream Fail2ban for read-only parser tests
+        uses: actions/checkout@v4
+        with:
+          repository: fail2ban/fail2ban
+          ref: '1.1.0'
+          path: .test-deps/fail2ban
+      - name: Parse generated configuration without starting services
+        env:
+          FAIL2BAN_SOURCE: ${{ github.workspace }}/.test-deps/fail2ban
+        run: python3 tests/test_fail2ban_config.py

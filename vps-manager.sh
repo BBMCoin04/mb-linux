@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.4.4"
+VERSION="1.5.0"
 PROGRAM="vps-manager"
 SUPPORTED_UBUNTU_CODENAMES=(jammy noble questing resolute)
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
@@ -18,7 +18,7 @@ BACKUP_ROOT="${VPS_MANAGER_BACKUP_ROOT:-/var/backups/vps-manager}"
 LOCK_FILE="/run/lock/vps-manager.lock"
 LOCK_HELD=0
 DEFAULT_TIMEZONE="${DEFAULT_TIMEZONE:-Asia/Shanghai}"
-DEFAULT_PORTS="${DEFAULT_PORTS:-22/tcp,80/tcp,443/tcp,443/udp,8443/tcp,8443/udp,2087/tcp}"
+DEFAULT_PORTS="${DEFAULT_PORTS:-}"
 CONFIG_ROOT="${VPS_MANAGER_CONFIG_ROOT:-/etc/vps-manager}"
 PORT_CONFIG_FILE="${VPS_MANAGER_PORT_CONFIG_FILE:-${CONFIG_ROOT}/ports.conf}"
 SWAP_FILE="${VPS_MANAGER_SWAP_FILE:-/swapfile}"
@@ -35,6 +35,13 @@ AUTO_UPGRADES_OPTIONS_FILE="${VPS_MANAGER_AUTO_UPGRADES_OPTIONS_FILE:-${APT_CONF
 APT_SOURCE_ROOT="${VPS_MANAGER_APT_SOURCE_ROOT:-/etc/apt}"
 DOCKER_KEY_FILE="${VPS_MANAGER_DOCKER_KEY_FILE:-${APT_SOURCE_ROOT}/keyrings/docker.asc}"
 DOCKER_SOURCE_FILE="${VPS_MANAGER_DOCKER_SOURCE_FILE:-${APT_SOURCE_ROOT}/sources.list.d/docker.sources}"
+ROLLBACK_HELPER="${VPS_MANAGER_ROLLBACK_HELPER:-${INSTALL_PATH}.rollback}"
+GUARD_ROOT="${VPS_MANAGER_GUARD_ROOT:-/var/lib/vps-manager/network-guard}"
+GUARD_TIMEOUT="${VPS_MANAGER_GUARD_TIMEOUT:-180}"
+ACTIVE_GUARD=""
+FAIL2BAN_JAIL="sshd"
+DOWNLOAD_CONNECT_TIMEOUT=10
+DOWNLOAD_TOTAL_TIMEOUT=90
 COMMON_PACKAGES=(
   ca-certificates
   curl
@@ -77,7 +84,7 @@ pause() {
 
 confirm() {
   local prompt="$1" answer
-  read -r -p "${prompt} [y/N]: " answer
+  read -r -p "${prompt} [y/N]: " answer || return 1
   [[ "$answer" =~ ^[Yy]$ ]]
 }
 
@@ -96,8 +103,8 @@ require_root() {
 }
 
 ensure_directories() {
-  install -d -m 0700 "$LOG_ROOT"
-  install -d -m 0755 "$(dirname "$LOCK_FILE")"
+  install -d -m 0700 "$LOG_ROOT" || return 1
+  install -d -m 0755 "$(dirname "$LOCK_FILE")" || return 1
 }
 
 atomic_install_file() {
@@ -107,6 +114,189 @@ atomic_install_file() {
     rm -f -- "$temporary"
     return 1
   fi
+}
+
+save_guard_snapshot() {
+  local guard="$1" name="$2" target="$3"
+  [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || {
+    error "配置路径不是普通文件，停止修改：${target}"
+    return 1
+  }
+  if [[ -f "$target" ]]; then
+    cp -a -- "$target" "$guard/$name" && : > "$guard/${name}.exists"
+  fi
+}
+
+start_network_guard() {
+  local kind="$1" guard unit old="" previous_state="" service="ssh.service" executable ufw_status
+  [[ "$GUARD_ROOT" == /* && "$GUARD_ROOT" != *[[:space:]]* && ! -L "$GUARD_ROOT" ]] || {
+    error "恢复目录必须是普通的绝对目录路径。"; return 1;
+  }
+  if [[ ! "$GUARD_TIMEOUT" =~ ^[0-9]{2,3}$ ]] || (( 10#$GUARD_TIMEOUT < 60 || 10#$GUARD_TIMEOUT > 900 )); then
+    error "恢复等待时间必须为 60–900 秒。"; return 1
+  fi
+  GUARD_TIMEOUT="$((10#$GUARD_TIMEOUT))"
+  for executable in systemd-run systemctl timeout flock; do
+    command -v "$executable" >/dev/null 2>&1 || { error "缺少 ${executable}，不能安全安排超时恢复。"; return 1; }
+  done
+  [[ -f "$ROLLBACK_HELPER" && ! -L "$ROLLBACK_HELPER" ]] || {
+    error "缺少配套恢复程序，请先用 v1.5.0 安装器安装完整版本。"; return 1;
+  }
+  [[ "$(bash "$ROLLBACK_HELPER" version)" == "vps-manager-network-rollback ${VERSION}" ]] || {
+    error "恢复程序版本不匹配，请重新运行安装器。"; return 1;
+  }
+  install -d -m 0700 "$GUARD_ROOT" || return 1
+  if [[ -f "$GUARD_ROOT/current" ]]; then
+    old="$(<"$GUARD_ROOT/current")"
+    if [[ -f "$old/state" ]]; then
+      previous_state="$(<"$old/state")"
+      case "$previous_state" in
+        pending|rolling-back|rollback-failed)
+          error "已有待确认或未恢复完成的网络修改（${previous_state}）：${old}"
+          info "待确认时可运行 sudo lm confirm-network；恢复失败时请用控制台检查 rollback.log。"
+          return 1 ;;
+      esac
+    fi
+  fi
+  guard="$(mktemp -d "$GUARD_ROOT/change.XXXXXXXX")" || return 1
+  unit="vps-manager-rollback-$(basename "$guard")"
+  printf '%s\n' "$kind" > "$guard/kind" || return 1
+  printf '%s\n' "$unit" > "$guard/unit" || return 1
+  printf '%s\n' "$(( $(date +%s) + GUARD_TIMEOUT ))" > "$guard/deadline" || return 1
+  printf '0\n' > "$guard/fail2ban-active" || return 1
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    printf '1\n' > "$guard/fail2ban-active" || return 1
+  fi
+  case "$kind" in
+    ssh)
+      save_guard_snapshot "$guard" ssh-config "$SSHD_MANAGED_FILE" || return 1
+      save_guard_snapshot "$guard" fail2ban-config "$FAIL2BAN_JAIL_FILE" || return 1
+      printf '%s\n' "$SSHD_MANAGED_FILE" > "$guard/ssh-target" || return 1
+      printf '%s\n' "$FAIL2BAN_JAIL_FILE" > "$guard/fail2ban-target" || return 1
+      printf '0\n' > "$guard/socket-active" || return 1
+      if ssh_socket_activated; then printf '1\n' > "$guard/socket-active" || return 1; fi
+      systemctl is-active --quiet sshd.service 2>/dev/null && service="sshd.service"
+      printf '%s\n' "$service" > "$guard/ssh-service" || return 1
+      printf '0\n' > "$guard/fail2ban-sshd-active" || return 1
+      if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client status sshd >/dev/null 2>&1; then
+        printf '1\n' > "$guard/fail2ban-sshd-active" || return 1
+      fi
+      ;;
+    ufw)
+      ufw_status="$(LC_ALL=C ufw status)" || { error "无法读取原 UFW 状态，停止修改。"; return 1; }
+      case "$ufw_status" in 'Status: active'*|'Status: inactive'*) ;; *) error "无法识别原 UFW 状态，停止修改。"; return 1 ;; esac
+      cp -a -- /etc/ufw "$guard/ufw" || return 1
+      save_guard_snapshot "$guard" ufw-default /etc/default/ufw || return 1
+      save_guard_snapshot "$guard" port-config "$PORT_CONFIG_FILE" || return 1
+      printf '%s\n' "$PORT_CONFIG_FILE" > "$guard/port-target" || return 1
+      printf '/etc/ufw\n' > "$guard/ufw-target" || return 1
+      printf '/etc/default/ufw\n' > "$guard/ufw-default-target" || return 1
+      printf '0\n' > "$guard/ufw-active" || return 1
+      if [[ "$ufw_status" == 'Status: active'* ]]; then printf '1\n' > "$guard/ufw-active" || return 1; fi
+      ;;
+    *) return 1 ;;
+  esac
+  cp -- "$ROLLBACK_HELPER" "$guard/rollback.sh" && chmod 0700 "$guard/rollback.sh" || return 1
+  bash -n "$guard/rollback.sh" || return 1
+  exec 8>"$guard/lock" || return 1
+  flock -x 8 || { exec 8>&-; return 1; }
+  printf 'pending\n' > "$guard/state" || { exec 8>&-; return 1; }
+  if ! systemd-run --quiet --collect --unit="$unit" --on-active="${GUARD_TIMEOUT}s" \
+    --timer-property=AccuracySec=1s --property=Type=oneshot --property=TimeoutStartSec=300 \
+    /bin/bash "$guard/rollback.sh" "$guard"; then
+    printf 'not-armed\n' > "$guard/state"
+    exec 8>&-
+    error "自动恢复任务创建失败，尚未修改网络配置。"
+    return 1
+  fi
+  ACTIVE_GUARD="$guard"
+  local pointer
+  pointer="$(mktemp "$GUARD_ROOT/.current.XXXXXX")" || { abort_network_guard; return 1; }
+  if ! printf '%s\n' "$guard" > "$pointer" || ! mv -f -- "$pointer" "$GUARD_ROOT/current"; then
+    rm -f -- "$pointer"
+    abort_network_guard
+    return 1
+  fi
+  info "已安排 ${GUARD_TIMEOUT} 秒超时恢复；当前 SSH 会话断开也会执行。"
+}
+
+abort_network_guard() {
+  local guard="${ACTIVE_GUARD:-}" unit
+  [[ -n "$guard" && -f "$guard/state" ]] || return 1
+  exec 8>&-
+  unit="$(<"$guard/unit")"
+  systemctl stop "${unit}.timer" >/dev/null 2>&1 || true
+  if bash "$guard/rollback.sh" "$guard"; then
+    warn "本次网络修改已撤销，原配置已恢复。"
+    ACTIVE_GUARD=""
+    return 0
+  fi
+  error "恢复未完整成功，请用云控制台检查：${guard}/rollback.log"
+  ACTIVE_GUARD=""
+  return 1
+}
+
+commit_network_guard() {
+  local guard="$1" unit state
+  exec 8>"$guard/lock" || return 1
+  flock -x 8 || { exec 8>&-; return 1; }
+  state="$(<"$guard/state")"
+  if [[ "$state" != pending ]]; then
+    exec 8>&-
+    [[ "$state" == confirmed ]] && return 0
+    error "本次修改已开始恢复或恢复失败，不能再确认保留。"
+    return 1
+  fi
+  if (( $(date +%s) >= $(<"$guard/deadline") )); then
+    exec 8>&-
+    error "确认时间已过，将恢复原配置。"
+    return 1
+  fi
+  printf 'confirmed\n' > "$guard/state" || { exec 8>&-; return 1; }
+  unit="$(<"$guard/unit")"
+  exec 8>&-
+  systemctl stop "${unit}.timer" >/dev/null 2>&1 || true
+  ok "已确认保留网络修改，超时恢复已取消。"
+}
+
+finish_network_guard() {
+  local guard="${ACTIVE_GUARD:-}" answer rc state
+  [[ -n "$guard" ]] || return 1
+  exec 8>&-
+  warn "请保持本窗口，另开 SSH 窗口验证登录和需要的服务。"
+  printf '验证成功后输入 y 保留；输入 n 撤销。未确认将自动恢复。\n'
+  while true; do
+    state="$(<"$guard/state")"
+    if [[ "$state" == confirmed ]]; then ACTIVE_GUARD=""; return 0; fi
+    if [[ "$state" != pending ]] || (( $(date +%s) >= $(<"$guard/deadline") )); then
+      abort_network_guard
+      return 1
+    fi
+    answer=""
+    read -r -t 5 answer
+    rc=$?
+    if (( rc == 0 )); then
+      case "$answer" in
+        y|Y) if commit_network_guard "$guard"; then ACTIVE_GUARD=""; return 0; fi; abort_network_guard; return 1 ;;
+        n|N) abort_network_guard; return 1 ;;
+        *) printf '请先用新窗口验证，再输入 y 保留，或输入 n 撤销。\n' ;;
+      esac
+    elif (( rc <= 128 )); then
+      abort_network_guard
+      return 1
+    fi
+  done
+}
+
+confirm_pending_network() {
+  local guard
+  require_root
+  [[ -f "$GUARD_ROOT/current" ]] || { info "没有待确认的网络修改。"; return 0; }
+  guard="$(<"$GUARD_ROOT/current")"
+  [[ "$guard" == "$GUARD_ROOT"/change.* && -f "$guard/state" && ! -L "$guard" ]] || return 1
+  [[ "$(<"$guard/state")" == pending ]] || { info "没有待确认的网络修改。"; return 0; }
+  confirm "已通过新的 SSH 连接验证登录和服务正常，确认保留？" || return 0
+  commit_network_guard "$guard"
 }
 
 validate_manager_paths() {
@@ -124,8 +314,10 @@ validate_manager_paths() {
 
 acquire_lock() {
   (( LOCK_HELD == 0 )) || return 0
-  ensure_directories
-  exec 9>"$LOCK_FILE"
+  ensure_directories || return 1
+  if [[ "$(readlink /proc/self/fd/9 2>/dev/null || true)" != "$LOCK_FILE" ]]; then
+    exec 9>"$LOCK_FILE" || return 1
+  fi
   if ! flock -n 9; then
     exec 9>&-
     warn "另一个 vps-manager 修改任务正在运行，本次操作退出。"
@@ -135,14 +327,14 @@ acquire_lock() {
 }
 
 log_line() {
-  ensure_directories
+  ensure_directories || return 1
   printf '[%s] %s\n' "$(date '+%F %T %z')" "$*" >> "$LOG_FILE"
 }
 
 log_command() {
   local mode="$1"
   shift
-  ensure_directories
+  ensure_directories || return 1
   printf '\n[%s] %s\n' "$(date '+%F %T %z')" "$*" >> "$LOG_FILE"
 
   if [[ "$mode" == "quiet" || ! -t 1 ]]; then
@@ -197,7 +389,7 @@ require_ubuntu() {
 apt_install() {
   require_root
   require_ubuntu || return 1
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y "$@"
 }
 
 ensure_command() {
@@ -286,6 +478,7 @@ ${PROGRAM} ${VERSION}
   ${PROGRAM} check-media  同 check-ai（兼容旧命令）
   ${PROGRAM} cleanup-system  执行带确认的保守系统清理
   ${PROGRAM} update       从 GitHub 更新 vps-manager
+  ${PROGRAM} confirm-network  在新连接中确认保留本次网络修改
   ${PROGRAM} version
 
 日志文件：${LOG_FILE}
@@ -336,7 +529,12 @@ system_upgrade() {
   acquire_lock || return 1
   info "准备更新软件源并执行完整系统升级；该操作可能安装新内核。"
   log_command interactive apt-get update || return 1
-  if ! log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y; then
+  local simulation
+  simulation="$(LC_ALL=C apt-get -s full-upgrade 2>&1)" || { error "无法预演系统升级。"; return 1; }
+  printf '%s\n' "$simulation" | awk '/^(Inst|Remv|[0-9]+ upgraded)/'
+  warn "完整升级可能重启服务，并按以上计划安装、更新或移除软件包。"
+  confirm "确认按以上计划升级系统？" || return 0
+  if ! log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 full-upgrade -y; then
     return 1
   fi
   if reboot_required; then
@@ -757,7 +955,7 @@ set_firewall_relaxed() {
 }
 
 set_firewall_tight() {
-  local ssh_ports backup_dir rule was_active=0 failed=0 docker_was_active=0
+  local ssh_ports backup_dir rule failed=0 docker_was_active=0
   require_root
   require_ubuntu || return 1
   ensure_ufw || return 1
@@ -772,23 +970,25 @@ set_firewall_tight() {
   printf '  允许端口：%s\n' "${PORT_RULES[*]}"
   printf '  默认策略：拒绝其他入站和转发，允许出站\n'
   warn "将清空现有 UFW 规则并按以上清单重建；云厂商安全组仍需单独配置。"
+  info "额外业务端口按你的端口清单放行；新安装默认只保留 SSH，不自动开放网站或代理端口。"
+  info "如清单缺少业务端口，请先取消，并用端口菜单添加。"
   if (( docker_was_active )); then
     warn "Docker 发布到公网的容器端口可能绕过 UFW；本模式不接管 Docker 防火墙链。"
   fi
   confirm "确认切换到收紧模式？" || return 0
   acquire_lock || return 1
-  if [[ ! -f "$PORT_CONFIG_FILE" ]] && ! save_managed_service_ports; then
-    error "无法保存收紧模式端口清单。"
-    return 1
-  fi
-
-  ufw_is_active && was_active=1
   backup_dir="${BACKUP_ROOT}/ufw-$(date '+%Y%m%d-%H%M%S').$$"
   install -d -m 0700 "$backup_dir" || return 1
   cp -a -- /etc/ufw "$backup_dir/ufw" || { error "无法备份 UFW 配置。"; return 1; }
   [[ ! -f /etc/default/ufw ]] || cp -a -- /etc/default/ufw "$backup_dir/default-ufw" || return 1
 
-  log_command quiet ufw --force reset || failed=1
+  start_network_guard ufw || return 1
+  if [[ ! -f "$PORT_CONFIG_FILE" ]] && ! save_managed_service_ports; then
+    error "无法保存收紧模式端口清单。"
+    abort_network_guard
+    return 1
+  fi
+  log_command quiet timeout 35s ufw --force reset || failed=1
   (( failed )) || log_command quiet ufw default deny incoming || failed=1
   (( failed )) || log_command quiet ufw default allow outgoing || failed=1
   (( failed )) || log_command quiet ufw default deny routed || failed=1
@@ -801,17 +1001,22 @@ set_firewall_tight() {
       fi
     done
   fi
-  (( failed )) || log_command quiet ufw --force enable || failed=1
+  (( failed )) || log_command quiet timeout 35s ufw --force enable || failed=1
+  (( failed )) || ufw_is_active || failed=1
+  if (( failed == 0 )); then
+    for rule in "${PORT_RULES[@]}"; do ufw_rule_exists "$rule" || failed=1; done
+  fi
+  if (( failed == 0 )) && systemctl is-active --quiet fail2ban 2>/dev/null; then
+    timeout 35s fail2ban-client reload --restart || failed=1
+  fi
 
   if (( failed )); then
-    if restore_ufw_backup "$backup_dir" "$was_active"; then
-      error "收紧模式应用失败，已恢复原配置。备份：${backup_dir}"
-    else
-      error "收紧模式应用失败，且自动恢复未完整成功。请保持当前会话并使用控制台检查 UFW。备份：${backup_dir}"
-    fi
+    error "收紧模式应用或运行检查失败，正在恢复。"
+    abort_network_guard
     show_firewall_status
     return 1
   fi
+  finish_network_guard || return 1
   ok "已切换到收紧模式，当前 SSH 端口均保持放行。"
   info "UFW 备份：${backup_dir}"
   if (( docker_was_active )); then
@@ -835,7 +1040,7 @@ firewall_menu() {
     printf '  3. 开启端口\n'
     printf '  4. 关闭端口\n'
     printf '  0. 返回\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) set_firewall_relaxed; pause ;;
       2) set_firewall_tight; pause ;;
@@ -942,7 +1147,7 @@ bbr_menu() {
     printf '  2. 启用 BBR\n'
     printf '  3. 移除 vps-manager 的 BBR 配置\n'
     printf '  0. 返回\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) bbr_status; pause ;;
       2)
@@ -977,7 +1182,7 @@ show_swap_status() {
 }
 
 validate_swap_path() {
-  [[ "$SWAP_FILE" == /* && "$SWAP_FILE" != *[[:space:]]* ]] || {
+  [[ "$SWAP_FILE" == /* && "$SWAP_FILE" != *[[:space:]]* && ! -L "$SWAP_FILE" ]] || {
     error "Swap 文件必须是不含空白的绝对路径：${SWAP_FILE}"
     return 1
   }
@@ -1020,7 +1225,7 @@ create_swap() {
     show_swap_status
     return 0
   fi
-  if [[ -e "$SWAP_FILE" ]]; then
+  if [[ -e "$SWAP_FILE" || -L "$SWAP_FILE" ]]; then
     error "${SWAP_FILE} 已存在但未作为 Swap 启用，脚本不会覆盖。"
     return 1
   fi
@@ -1168,7 +1373,7 @@ swap_menu() {
     printf '  2. 创建并启用 Swap\n'
     printf '  3. 删除 vps-manager 管理的 Swap\n'
     printf '  0. 返回\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) show_swap_status; pause ;;
       2) create_swap; pause ;;
@@ -1182,6 +1387,7 @@ swap_menu() {
 validate_ipv4() {
   local value="$1" octet
   local -a octets=()
+  [[ "$value" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
   IFS='.' read -r -a octets <<< "$value"
   (( ${#octets[@]} == 4 )) || return 1
   for octet in "${octets[@]}"; do
@@ -1212,6 +1418,7 @@ validate_ipv6() {
   [[ "$value" =~ ^[0-9a-f:]+$ && "$value" != *:::* ]] || return 1
   if [[ "$value" == *::* ]]; then
     [[ "${value#*::}" != *::* ]] || return 1
+    [[ "$value" != *: || "$value" == *:: ]] || return 1
     left="${value%%::*}"
     right="${value#*::}"
     left_count="$(count_ipv6_groups "$left")" || return 1
@@ -1285,6 +1492,17 @@ dns_resolution_works() {
   return 1
 }
 
+configured_dns_works() {
+  local dns_addresses="$1" server answer host
+  for server in $dns_addresses; do
+    for host in ubuntu.com cloudflare.com; do
+      answer="$(timeout 7s dig +time=2 +tries=1 +short "@${server}" "$host" A 2>/dev/null)" || continue
+      if grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' <<< "$answer"; then return 0; fi
+    done
+  done
+  return 1
+}
+
 apply_dns_servers() {
   local label="$1" dns="$2" fallback="$3" resolved_file="$RESOLVED_CONFIG_FILE"
   local rollback rollback_dir temporary candidate server
@@ -1300,6 +1518,9 @@ apply_dns_servers() {
   fi
   confirm "确认修改 DNS 配置？" || return 0
   acquire_lock || return 1
+  ensure_command dig dnsutils || return 1
+  info "先直接查询你指定的 DNS，避免旧缓存造成误判。"
+  configured_dns_works "${dns} ${fallback}" || { error "指定 DNS 未通过直接解析测试，原配置未修改。"; return 1; }
 
   if systemd_resolved_manages_dns; then
     rollback="$(mktemp /tmp/vps-manager-resolved-old.XXXXXX)" || return 1
@@ -1312,7 +1533,8 @@ apply_dns_servers() {
        atomic_install_file "$candidate" "$resolved_file" 0644 &&
        systemctl restart systemd-resolved && dns_resolution_works; then
       rm -f -- "$rollback" "$candidate"
-      ok "systemd-resolved DNS 已更新并通过解析测试。"
+      ok "systemd-resolved 配置已更新，指定 DNS 与系统解析测试通过。"
+      info "接口级 DHCP / netplan DNS 仍可能参与解析，请结合下方状态确认。"
       show_dns_status
       return 0
     fi
@@ -1388,7 +1610,7 @@ dns_menu() {
     printf '  5. Quad9\n'
     printf '  6. 自定义\n'
     printf '  0. 返回\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) show_dns_status; pause ;;
       2) apply_dns_servers "Cloudflare + Google" "1.1.1.1 1.0.0.1" "8.8.8.8 8.8.4.4"; pause ;;
@@ -1410,18 +1632,56 @@ sshd_config_file() {
   printf '/etc/ssh/sshd_config'
 }
 
-current_ssh_ports() {
-  local sshd connection_port="${SSH_CONNECTION:-}" output=""
+configured_ssh_ports() {
+  local sshd output
   sshd="$(sshd_bin)"
-  if [[ -x "$sshd" ]]; then
-    output="$("$sshd" -T 2>/dev/null | awk '$1=="port" && !seen[$2]++ {print $2}' || true)"
+  [[ -x "$sshd" ]] || return 1
+  output="$("$sshd" -T 2>/dev/null)" || return 1
+  awk '$1=="port" && $2 ~ /^[0-9]+$/ && $2>=1 && $2<=65535 && !seen[$2]++ {print $2}' <<< "$output"
+}
+
+ssh_socket_ports() {
+  local listeners
+  ssh_socket_activated || return 0
+  listeners="$(systemctl show ssh.socket --property=Listen --value 2>/dev/null)" || return 1
+  awk '{
+    line=$0
+    while (match(line, /[^[:space:]]+:[0-9]+[[:space:]]+\(Stream\)/)) {
+      entry=substr(line,RSTART,RLENGTH); sub(/[[:space:]].*/,"",entry); sub(/^.*:/,"",entry)
+      if (entry>=1 && entry<=65535 && !seen[entry]++) print entry
+      line=substr(line,RSTART+RLENGTH)
+    }
+  }' <<< "$listeners"
+}
+
+live_ssh_ports() {
+  local listeners socket_ports
+  command -v ss >/dev/null 2>&1 || { error "缺少 ss，无法核对实际 SSH 监听。"; return 1; }
+  listeners="$(ss -H -ltnp 2>/dev/null)" || return 1
+  socket_ports="$(ssh_socket_ports)" || return 1
+  awk -v socket_ports="$socket_ports" '
+    BEGIN {split(socket_ports, values, "\n"); for (i in values) sockets[values[i]]=1}
+    {
+      port=$4; sub(/^.*:/,"",port)
+      if (port !~ /^[0-9]+$/ || port<1 || port>65535) next
+      if ($0 ~ /"sshd"|"sshd-session"/ || ($0 ~ /"systemd"/ && sockets[port])) {
+        if (!seen[port]++) print port
+      }
+    }
+  ' <<< "$listeners"
+}
+
+current_ssh_ports() {
+  local configured live socket_ports connection_port=""
+  live="$(live_ssh_ports)" || return 1
+  [[ -n "$live" ]] || { error "未能确认由 SSH 或 ssh.socket 实际监听的端口。"; return 1; }
+  configured="$(configured_ssh_ports || true)"
+  socket_ports="$(ssh_socket_ports)" || return 1
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    connection_port="$(awk '{print $4}' <<< "$SSH_CONNECTION")"
   fi
-  if [[ -n "$connection_port" ]]; then
-    connection_port="$(awk '{print $4}' <<< "$connection_port")"
-    [[ "$connection_port" =~ ^[0-9]+$ ]] && output="${output}${output:+$'\n'}${connection_port}"
-  fi
-  [[ -n "$output" ]] || return 1
-  printf '%s\n' "$output" | awk '/^[0-9]+$/ && !seen[$0]++'
+  printf '%s\n' "$live" "$configured" "$socket_ports" "$connection_port" |
+    awk '/^[0-9]+$/ && $1>=1 && $1<=65535 && !seen[$1]++ {print $1}' | sort -n
 }
 
 ssh_socket_activated() {
@@ -1431,8 +1691,7 @@ ssh_socket_activated() {
 
 ssh_port_listening() {
   local port="$1"
-  command -v ss >/dev/null 2>&1 || return 1
-  ss -H -ltn 2>/dev/null | awk -v suffix=":${port}" '$4 ~ suffix "$" {found=1} END {exit !found}'
+  live_ssh_ports | grep -Fxq "$port"
 }
 
 show_ssh_status() {
@@ -1447,6 +1706,10 @@ show_ssh_status() {
   fi
   printf '\n%s 中的相关配置：\n' "$config"
   grep -Ein '^[#[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication)[[:space:]]+' "$config" 2>/dev/null || true
+  printf '\n实际 SSH 监听端口：\n'
+  live_ssh_ports | sed 's/^/  /' || true
+  printf '\nssh.socket 端口：\n'
+  ssh_socket_ports | sed 's/^/  /' || true
   printf '\nvps-manager 管理文件：%s\n' "$SSHD_MANAGED_FILE"
   sed -n '1,80p' "$SSHD_MANAGED_FILE" 2>/dev/null || printf '  尚未创建\n'
 }
@@ -1461,113 +1724,100 @@ set_sshd_option_in_file() {
 }
 
 reload_ssh_service() {
-  if command -v systemctl >/dev/null 2>&1; then
-    if ssh_socket_activated; then
-      systemctl daemon-reload || return 1
-      systemctl restart ssh.socket || return 1
-      if systemctl is-active --quiet ssh.service 2>/dev/null; then
-        systemctl reload ssh.service || return 1
-      fi
-      return 0
+  command -v systemctl >/dev/null 2>&1 || return 1
+  if ssh_socket_activated; then
+    if systemctl is-active --quiet ssh.service 2>/dev/null &&
+      [[ "$(systemctl show ssh.service --property=KillMode --value 2>/dev/null)" != process ]]; then
+      error "ssh.service 的 KillMode 不是 process，无法保证重启主进程时保留已有会话。"
+      return 1
     fi
-    systemctl reload ssh 2>/dev/null && return 0
-    systemctl reload sshd 2>/dev/null && return 0
+    timeout 35s systemctl daemon-reload || return 1
+    timeout 35s systemctl restart ssh.socket || return 1
+    if systemctl is-active --quiet ssh.service 2>/dev/null; then
+      # Socket-activated sshd must receive the newly opened descriptors.
+      timeout 35s systemctl restart ssh.service || return 1
+    fi
+    return 0
   fi
-  service ssh reload 2>/dev/null && return 0
-  service sshd reload 2>/dev/null && return 0
+  timeout 35s systemctl reload ssh 2>/dev/null && return 0
+  timeout 35s systemctl reload sshd 2>/dev/null
 }
 
 apply_sshd_options() {
-  local config backup="" sshd option value key effective index valid=1 had_file=0 restore_failed=0
+  local config sshd option value candidate index
   local -a settings=("$@")
   (( ${#settings[@]} > 0 && ${#settings[@]} % 2 == 0 )) || return 1
   require_root
   require_ubuntu || return 1
   config="$(sshd_config_file)"
   sshd="$(sshd_bin)"
-  [[ -f "$config" ]] || { error "未找到 ${config}。"; return 1; }
-  [[ -x "$sshd" ]] || { error "未找到 sshd。"; return 1; }
-
+  [[ -f "$config" && -x "$sshd" ]] || { error "未找到有效的 OpenSSH 配置。"; return 1; }
   show_ssh_status
   printf '\n准备设置：\n'
-  for (( index = 0; index < ${#settings[@]}; index += 2 )); do
-    printf '  %s %s\n' "${settings[$index]}" "${settings[$((index + 1))]}"
+  for (( index=0; index<${#settings[@]}; index+=2 )); do
+    printf '  %s %s\n' "${settings[$index]}" "${settings[$((index+1))]}"
   done
-  confirm "确认修改 SSH 配置？" || return 2
+  confirm "确认修改 SSH 配置？未确认保留时将自动恢复。" || return 2
   acquire_lock || return 1
-  install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")"
+  install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")" || return 1
+  candidate="$(mktemp /tmp/vps-manager-sshd.XXXXXX)" || return 1
   if [[ -f "$SSHD_MANAGED_FILE" ]]; then
-    had_file=1
-    install -d -m 0700 "$BACKUP_ROOT" || return 1
-    backup="${BACKUP_ROOT}/etc_ssh_sshd_config.d_00-vps-manager.conf.bak.$(date '+%Y%m%d-%H%M%S').$$"
-    cp -a -- "$SSHD_MANAGED_FILE" "$backup" || { error "无法备份 SSH 管理配置。"; return 1; }
-  elif ! : > "$SSHD_MANAGED_FILE"; then
-    error "无法创建 SSH 管理配置。"
+    cp -a -- "$SSHD_MANAGED_FILE" "$candidate" || { rm -f -- "$candidate"; return 1; }
+  fi
+  if grep -qiE '^[[:space:]]*Match[[:space:]]' "$candidate"; then
+    error "管理文件包含自定义 Match 区块，请先手动整理，避免修改错误的范围。"
+    rm -f -- "$candidate"
     return 1
   fi
-
-  for (( index = 0; index < ${#settings[@]}; index += 2 )); do
-    option="${settings[$index]}"
-    value="${settings[$((index + 1))]}"
-    if ! set_sshd_option_in_file "$SSHD_MANAGED_FILE" "$option" "$value"; then
-      valid=0
-      break
-    fi
+  for (( index=0; index<${#settings[@]}; index+=2 )); do
+    option="${settings[$index]}"; value="${settings[$((index+1))]}"
+    set_sshd_option_in_file "$candidate" "$option" "$value" || { rm -f -- "$candidate"; return 1; }
   done
-  (( valid )) && chmod 0644 "$SSHD_MANAGED_FILE" || valid=0
+  apply_ssh_candidate "$candidate" options "${settings[@]}"
+}
 
-  if (( valid )) && "$sshd" -t -f "$config"; then
-    for (( index = 0; index < ${#settings[@]}; index += 2 )); do
-      option="${settings[$index]}"
-      value="${settings[$((index + 1))]}"
-      key="${option,,}"
-      [[ "$key" != "challengeresponseauthentication" ]] || key="kbdinteractiveauthentication"
-      if [[ "$key" == "port" ]]; then
-        effective="$("$sshd" -T -f "$config" 2>/dev/null | awk '$1=="port" {print $2}' | paste -sd' ' -)"
-        [[ " ${effective} " == *" ${value} "* ]] || valid=0
-      else
-        effective="$("$sshd" -T -f "$config" 2>/dev/null | awk -v key="$key" '$1==key {print $2; exit}')"
-        [[ "${effective,,}" == "${value,,}" ]] || valid=0
-      fi
-      if (( valid == 0 )); then
-        error "${option} 最终生效值为 ${effective:-未知}，不是目标值 ${value}。"
-        break
-      fi
-    done
-  else
-    valid=0
-    error "SSH 配置写入或语法校验失败。"
-  fi
-
-  if (( valid )) && reload_ssh_service; then
-    for (( index = 0; index < ${#settings[@]}; index += 2 )); do
-      if [[ "${settings[$index],,}" == "port" ]] && ! ssh_port_listening "${settings[$((index + 1))]}"; then
-        error "SSH 未实际监听目标端口 ${settings[$((index + 1))]}。"
-        valid=0
-        break
-      fi
-    done
-    if (( valid )); then
-      ok "SSH 配置已更新并生效：${SSHD_MANAGED_FILE}"
-      [[ -n "$backup" ]] && info "备份：${backup}"
-      return 0
+apply_ssh_candidate() {
+  local candidate="$1" mode="$2" config sshd effective key value index valid=1
+  shift 2
+  local -a expected=("$@")
+  config="$(sshd_config_file)"; sshd="$(sshd_bin)"
+  backup_file "$SSHD_MANAGED_FILE" || { rm -f -- "$candidate"; return 1; }
+  start_network_guard ssh || { rm -f -- "$candidate"; return 1; }
+  atomic_install_file "$candidate" "$SSHD_MANAGED_FILE" 0644 || valid=0
+  rm -f -- "$candidate"
+  if (( valid )); then "$sshd" -t -f "$config" || valid=0; fi
+  if (( valid )); then
+    effective="$("$sshd" -T -f "$config" 2>/dev/null)" || valid=0
+    if [[ "$mode" == ports ]]; then
+      for value in "${expected[@]}"; do
+        awk -v value="$value" '$1=="port" && $2==value {found=1} END {exit !found}' <<< "$effective" || valid=0
+      done
+    else
+      for (( index=0; index<${#expected[@]}; index+=2 )); do
+        key="${expected[$index],,}"; value="${expected[$((index+1))]}"
+        [[ "$key" != challengeresponseauthentication ]] || key=kbdinteractiveauthentication
+        [[ "$(awk -v key="$key" '$1==key {print $2; exit}' <<< "$effective")" == "$value" ]] || valid=0
+      done
     fi
-  elif (( valid )); then
-    warn "配置校验通过，但 SSH 服务重载失败。"
   fi
-
-  warn "SSH 修改未能完整生效，正在恢复。"
-  if (( had_file )); then
-    cp -a -- "$backup" "$SSHD_MANAGED_FILE" || restore_failed=1
-  else
-    rm -f -- "$SSHD_MANAGED_FILE" || restore_failed=1
+  if (( valid )); then reload_ssh_service || valid=0; fi
+  if (( valid )); then
+    if [[ "$mode" == ports ]]; then
+      for value in "${expected[@]}"; do
+        ssh_port_listening "$value" || { error "SSH 未实际监听 ${value}/tcp。"; valid=0; }
+      done
+      if (( valid )); then sync_fail2ban_ssh_ports || valid=0; fi
+    else
+      [[ -n "$(live_ssh_ports)" ]] || valid=0
+    fi
   fi
-  if (( restore_failed == 0 )) && "$sshd" -t -f "$config" && reload_ssh_service; then
-    warn "SSH 原配置已恢复。"
-  else
-    error "SSH 原配置恢复或重载失败，请保持当前会话并使用控制台检查。"
+  if (( valid == 0 )); then
+    error "SSH 配置、实际监听或 Fail2ban 配套检查未通过，正在恢复。"
+    abort_network_guard
+    return 1
   fi
-  return 1
+  ok "本机检查通过；请从新窗口验证 SSH 登录。"
+  finish_network_guard
 }
 
 apply_sshd_option() {
@@ -1575,95 +1825,35 @@ apply_sshd_option() {
 }
 
 apply_ssh_ports() {
-  local config sshd backup="" candidate effective port had_file=0 valid=1
-  local -a requested=("$@") unique=()
+  local port candidate
+  local -a unique=()
   local -A seen=()
-  (( ${#requested[@]} > 0 )) || return 1
+  (( $# > 0 )) || return 1
   require_root
   require_ubuntu || return 1
-  config="$(sshd_config_file)"
-  sshd="$(sshd_bin)"
-  [[ -f "$config" ]] || { error "未找到 ${config}。"; return 1; }
-  [[ -x "$sshd" ]] || { error "未找到 sshd。"; return 1; }
-
-  for port in "${requested[@]}"; do
-    [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || {
-      error "SSH 端口不正确：${port}"
-      return 1
-    }
+  for port in "$@"; do
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port>=1 && 10#$port<=65535 )) || return 1
     port="$((10#$port))"
-    [[ -n "${seen[$port]:-}" ]] && continue
-    unique+=("$port")
-    seen["$port"]=1
+    [[ -z "${seen[$port]:-}" ]] || continue
+    unique+=("$port"); seen["$port"]=1
   done
-
   show_ssh_status
-  printf '\n准备保留并监听以下 SSH TCP 端口：\n'
-  printf '  %s/tcp\n' "${unique[@]}"
-  confirm "确认修改 SSH 监听端口？" || return 2
+  printf '\n准备保留并监听：%s\n' "${unique[*]}"
+  confirm "确认修改 SSH 端口？未确认保留时将自动恢复。" || return 2
   acquire_lock || return 1
-
   install -d -m 0755 "$(dirname "$SSHD_MANAGED_FILE")" || return 1
-  install -d -m 0700 "$BACKUP_ROOT" || return 1
   candidate="$(mktemp /tmp/vps-manager-sshd.XXXXXX)" || return 1
   if [[ -f "$SSHD_MANAGED_FILE" ]]; then
-    had_file=1
-    backup="${BACKUP_ROOT}/etc_ssh_sshd_config.d_00-vps-manager.conf.bak.$(date '+%Y%m%d-%H%M%S').$$"
-    cp -a -- "$SSHD_MANAGED_FILE" "$backup" || { rm -f -- "$candidate"; return 1; }
-    awk 'tolower($1)!="port"' "$SSHD_MANAGED_FILE" > "$candidate" || valid=0
-  else
-    printf '# Managed by vps-manager.\n' > "$candidate" || valid=0
-  fi
-  if (( valid )); then
-    printf '\n# Keep every listed port until the user removes it manually.\n' >> "$candidate" || valid=0
-    for port in "${unique[@]}"; do
-      printf 'Port %s\n' "$port" >> "$candidate" || { valid=0; break; }
-    done
-  fi
-  if (( valid )) && ! atomic_install_file "$candidate" "$SSHD_MANAGED_FILE" 0644; then
-    valid=0
-  fi
-  rm -f -- "$candidate"
-
-  if (( valid )) && "$sshd" -t -f "$config"; then
-    effective="$("$sshd" -T -f "$config" 2>/dev/null | awk '$1=="port" {print $2}' | paste -sd' ' -)"
-    for port in "${unique[@]}"; do
-      if [[ " ${effective} " != *" ${port} "* ]]; then
-        error "SSH 有效配置未包含 ${port}/tcp。"
-        valid=0
-        break
-      fi
-    done
-  else
-    valid=0
-    error "SSH 端口配置写入或语法校验失败。"
-  fi
-
-  if (( valid )) && reload_ssh_service; then
-    for port in "${unique[@]}"; do
-      if ! ssh_port_listening "$port"; then
-        error "SSH 未实际监听 ${port}/tcp。"
-        valid=0
-        break
-      fi
-    done
-    if (( valid )); then
-      ok "SSH 已同时监听：${unique[*]}"
-      [[ -z "$backup" ]] || info "备份：${backup}"
-      return 0
+    if grep -qiE '^[[:space:]]*Match[[:space:]]' "$SSHD_MANAGED_FILE"; then
+      error "管理文件包含自定义 Match 区块，已停止自动修改。"
+      rm -f -- "$candidate"; return 1
     fi
-  elif (( valid )); then
-    error "SSH 配置有效，但服务重载失败。"
+    awk 'tolower($1)!="port"' "$SSHD_MANAGED_FILE" > "$candidate" || { rm -f -- "$candidate"; return 1; }
   fi
-
-  warn "SSH 端口修改未完整生效，正在恢复原管理配置。"
-  if (( had_file )); then
-    cp -a -- "$backup" "$SSHD_MANAGED_FILE" || error "恢复 SSH 管理配置失败，请保持当前会话并使用控制台检查。"
-  else
-    rm -f -- "$SSHD_MANAGED_FILE"
-  fi
-  reload_ssh_service || warn "SSH 原配置重载失败，请保持当前会话并使用控制台检查。"
-  return 1
+  for port in "${unique[@]}"; do
+    printf 'Port %s\n' "$port" >> "$candidate" || { rm -f -- "$candidate"; return 1; }
+  done
+  apply_ssh_candidate "$candidate" ports "${unique[@]}"
 }
 
 change_ssh_port() {
@@ -1697,7 +1887,6 @@ change_ssh_port() {
   apply_ssh_ports "${target_ports[@]}"
   rc=$?
   if (( rc == 0 )); then
-    sync_fail2ban_ssh_ports || true
     ok "新端口 ${port}/tcp 已生效；原 SSH 端口 ${current_ports[*]} 均继续保留。"
     warn "请先用新窗口验证 ${port}/tcp，再考虑手动清理任何旧端口。"
     return 0
@@ -1792,7 +1981,7 @@ ssh_menu() {
     printf '  5. 关闭密码登录\n'
     printf '  6. 新增 SSH 端口（保留现有端口）\n'
     printf '  0. 返回\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) show_ssh_status; pause ;;
       2) warn "开启 root 登录会增加暴力破解风险。"; apply_sshd_option PermitRootLogin yes; pause ;;
@@ -1806,44 +1995,45 @@ ssh_menu() {
   done
 }
 
+fail2ban_runtime_actions() {
+  fail2ban-client get "$FAIL2BAN_JAIL" actions 2>/dev/null | tr ',' '\n' |
+    awk '/^[[:space:]]*[[:alnum:]_.-]+[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$0); print}'
+}
+
+fail2ban_runtime_ports() {
+  local action ports found=0
+  while IFS= read -r action; do
+    ports="$(fail2ban-client get "$FAIL2BAN_JAIL" action "$action" port 2>/dev/null)" || continue
+    [[ -n "$ports" ]] || continue
+    printf '%s: %s\n' "$action" "$ports"
+    found=1
+  done < <(fail2ban_runtime_actions)
+  (( found ))
+}
+
 show_fail2ban_status() {
-  local status service_state enabled_state port="由现有配置决定" current_failed=0 total_failed=0 current_banned=0 total_banned=0 banned_list=""
-  local maxretry="" findtime="" bantime=""
-  if ! command -v fail2ban-client >/dev/null 2>&1; then
-    printf 'Fail2ban：未安装\n'
+  local status maxretry findtime bantime
+  if ! command -v fail2ban-client >/dev/null 2>&1; then printf 'Fail2ban：未安装（可选功能）\n'; return 0; fi
+  if ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+    printf 'Fail2ban：未运行\n开机启动：%s\n' "$(systemctl is-enabled fail2ban 2>/dev/null || true)"
     return 0
   fi
-  service_state="$(systemctl is-active fail2ban 2>/dev/null || true)"
-  enabled_state="$(systemctl is-enabled fail2ban 2>/dev/null || true)"
-  [[ "$service_state" == "active" ]] || {
-    printf 'Fail2ban：未运行\n'
-    printf '开机启动：%s\n' "${enabled_state:-未知}"
+  if ! status="$(LC_ALL=C fail2ban-client status "$FAIL2BAN_JAIL" 2>/dev/null)"; then
+    printf 'Fail2ban：运行中；SSH 防护未启用或未就绪\n'
     return 0
-  }
-  if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
-    port="$(awk -F= '/^[[:space:]]*port[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$FAIL2BAN_JAIL_FILE")"
   fi
-  status="$(LC_ALL=C fail2ban-client status sshd 2>/dev/null || true)"
-  [[ -n "$status" ]] || {
-    printf 'Fail2ban：运行中\nSSH 保护：jail 暂未就绪或未启用\n'
-    return 0
-  }
-  current_failed="$(printf '%s\n' "$status" | awk -F: '/Currently failed/{gsub(/[[:space:]]/, "", $2); print $2}')"
-  total_failed="$(printf '%s\n' "$status" | awk -F: '/Total failed/{gsub(/[[:space:]]/, "", $2); print $2}')"
-  current_banned="$(printf '%s\n' "$status" | awk -F: '/Currently banned/{gsub(/[[:space:]]/, "", $2); print $2}')"
-  total_banned="$(printf '%s\n' "$status" | awk -F: '/Total banned/{gsub(/[[:space:]]/, "", $2); print $2}')"
-  banned_list="$(printf '%s\n' "$status" | awk '/Banned IP list/{sub(/^[^:]*:[[:space:]]*/, ""); print}')"
-  maxretry="$(fail2ban-client get sshd maxretry 2>/dev/null || true)"
-  findtime="$(fail2ban-client get sshd findtime 2>/dev/null || true)"
-  bantime="$(fail2ban-client get sshd bantime 2>/dev/null || true)"
-  printf 'Fail2ban：运行中\n'
-  printf 'SSH 保护：已启用（端口 %s）\n' "${port:-未知}"
-  printf '失败登录：当前 %s，累计 %s\n' "${current_failed:-0}" "${total_failed:-0}"
-  printf '封禁地址：当前 %s，累计 %s\n' "${current_banned:-0}" "${total_banned:-0}"
-  [[ -z "$banned_list" ]] || printf '当前名单：%s\n' "$banned_list"
-  if [[ -n "$maxretry" && -n "$findtime" && -n "$bantime" ]]; then
-    printf '生效规则：%s 秒内失败 %s 次，封禁 %s 秒\n' "$findtime" "$maxretry" "$bantime"
-  fi
+  printf 'Fail2ban：运行中；SSH 防护已启用\n实际封禁动作与端口：\n'
+  fail2ban_runtime_ports || printf '  自定义动作，无法自动读取端口，请核对其配置。\n'
+  printf '%s\n' "$status" | awk -F: '
+    /Currently failed/ {print "当前失败记录：" $2}
+    /Total failed/ {print "累计失败记录：" $2}
+    /Currently banned/ {print "当前封禁数量：" $2}
+    /Total banned/ {print "累计封禁数量：" $2}
+    /Banned IP list/ {sub(/^[^:]*:/, ""); print "封禁 IP：" $0}'
+  maxretry="$(fail2ban-client get "$FAIL2BAN_JAIL" maxretry 2>/dev/null || true)"
+  findtime="$(fail2ban-client get "$FAIL2BAN_JAIL" findtime 2>/dev/null || true)"
+  bantime="$(fail2ban-client get "$FAIL2BAN_JAIL" bantime 2>/dev/null || true)"
+  printf '生效规则：%s 秒内失败 %s 次，封禁 %s 秒\n' "$findtime" "$maxretry" "$bantime"
 }
 
 wait_for_fail2ban_sshd() {
@@ -1856,132 +2046,340 @@ wait_for_fail2ban_sshd() {
 }
 
 fail2ban_sshd_rule_matches() {
-  [[ "$(fail2ban-client get sshd maxretry 2>/dev/null || true)" == "5" ]] &&
-    [[ "$(fail2ban-client get sshd findtime 2>/dev/null || true)" == "600" ]] &&
-    [[ "$(fail2ban-client get sshd bantime 2>/dev/null || true)" == "3600" ]]
+  [[ "$(fail2ban-client get "$FAIL2BAN_JAIL" maxretry 2>/dev/null || true)" == "${1:-5}" ]] &&
+    [[ "$(fail2ban-client get "$FAIL2BAN_JAIL" findtime 2>/dev/null || true)" == "${2:-600}" ]] &&
+    [[ "$(fail2ban-client get "$FAIL2BAN_JAIL" bantime 2>/dev/null || true)" == "${3:-3600}" ]]
 }
 
-fail2ban_managed_ports_match() {
-  local expected="$1" configured
-  configured="$(awk -F= '/^[[:space:]]*port[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$FAIL2BAN_JAIL_FILE" 2>/dev/null)"
-  [[ "$configured" == "$expected" ]]
+ports_cover_expected() {
+  local required_ports="$1" configured="$2" token wanted start end found
+  local -a tokens=() requested=()
+  configured="${configured//,/ }"; required_ports="${required_ports//,/ }"
+  read -r -a tokens <<< "$configured"
+  read -r -a requested <<< "$required_ports"
+  (( ${#tokens[@]} && ${#requested[@]} )) || return 1
+  for wanted in "${requested[@]}"; do
+    [[ "$wanted" =~ ^[0-9]{1,5}$ ]] || return 1
+    found=0
+    for token in "${tokens[@]}"; do
+      if [[ "$token" == ssh ]]; then token=22; fi
+      if [[ "$token" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]]; then
+        start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+        (( 10#$start<=10#$wanted && 10#$wanted<=10#$end )) && found=1
+      elif [[ "$token" =~ ^[0-9]{1,5}$ ]] && (( 10#$token == 10#$wanted )); then
+        found=1
+      fi
+    done
+    (( found )) || return 1
+  done
 }
 
-sync_fail2ban_ssh_ports() {
-  local ports backup
-  [[ -f "$FAIL2BAN_JAIL_FILE" ]] || return 0
-  ports="$(current_ssh_ports | paste -sd, -)" || return 1
-  [[ -n "$ports" ]] || return 1
-  backup="$(mktemp /tmp/vps-manager-fail2ban.XXXXXX)" || return 1
-  cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { rm -f -- "$backup"; return 1; }
-  if sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port = ${ports}/" "$FAIL2BAN_JAIL_FILE" &&
-     fail2ban_managed_ports_match "$ports" &&
-     command -v fail2ban-client >/dev/null 2>&1 &&
-     fail2ban-client -t >/dev/null 2>&1 &&
-     systemctl restart fail2ban >/dev/null 2>&1 &&
-     wait_for_fail2ban_sshd && fail2ban_sshd_rule_matches; then
-    rm -f -- "$backup"
-    ok "Fail2ban SSH jail 已同步并验证端口 ${ports}。"
-    return 0
-  fi
-  cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE" || true
-  rm -f -- "$backup"
-  systemctl restart fail2ban >/dev/null 2>&1 || true
-  wait_for_fail2ban_sshd || true
-  warn "Fail2ban 端口同步或生效验证失败，已恢复原配置。"
+fail2ban_effective_ports_match() {
+  local required_ports="$1" action ports protocol ban type
+  while IFS= read -r action; do
+    ban="$(fail2ban-client get "$FAIL2BAN_JAIL" action "$action" actionban 2>/dev/null)" || continue
+    case "$ban" in *nft*|*iptables*|*ip6tables*|*ufw*|*firewall-cmd*) ;; *) continue ;; esac
+    protocol="$(fail2ban-client get "$FAIL2BAN_JAIL" action "$action" protocol 2>/dev/null)" || continue
+    [[ "$protocol" == tcp || "$protocol" == all ]] || continue
+    type="$(fail2ban-client get "$FAIL2BAN_JAIL" action "$action" type 2>/dev/null || true)"
+    [[ "$type" != allports ]] || return 0
+    ports="$(fail2ban-client get "$FAIL2BAN_JAIL" action "$action" port 2>/dev/null)" || continue
+    ports_cover_expected "$required_ports" "$ports" && return 0
+  done < <(fail2ban_runtime_actions)
   return 1
 }
 
+fail2ban_disk_jail_enabled() {
+  local dump
+  dump="$(timeout 35s fail2ban-client -d 2>/dev/null)" || return 2
+  [[ -n "$dump" ]] || return 2
+  grep -Eq "^\\['add',[[:space:]]*'sshd'," <<< "$dump"
+}
+
+set_fail2ban_key() {
+  local file="$1" key="$2" value="$3" temporary
+  temporary="$(mktemp /tmp/vps-manager-jail-key.XXXXXX)" || return 1
+  awk -v key="$key" -v value="$value" '
+    function finish() {if (inside && !written) {print key " = " value; written=1}}
+    /^[[:space:]]*\[/ {
+      finish(); inside=($0 ~ /^[[:space:]]*\[sshd\][[:space:]]*$/)
+      if (inside) found=1
+    }
+    inside && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {if (!written) print key " = " value; written=1; next}
+    {print}
+    END {finish(); if (!found) print "\n[sshd]\n" key " = " value}
+  ' "$file" > "$temporary" || { rm -f -- "$temporary"; return 1; }
+  mv -f -- "$temporary" "$file" || { rm -f -- "$temporary"; return 1; }
+}
+
+validate_fail2ban_configuration() {
+  local details candidate
+  if details="$(timeout 35s fail2ban-client -t 2>&1)"; then return 0; fi
+  # Fail2ban cannot interpolate known/ignoreip when no earlier file defines it.
+  # Only our exact template is eligible for this fallback; all other errors fail.
+  if [[ "$details" == *known/ignoreip* ]] &&
+    grep -Fxq 'ignoreip = %(known/ignoreip)s %(vps_manager_whitelist)s' "$FAIL2BAN_JAIL_FILE"; then
+    candidate="$(mktemp /tmp/vps-manager-jail-fallback.XXXXXX)" || return 1
+    cp -- "$FAIL2BAN_JAIL_FILE" "$candidate" || { rm -f -- "$candidate"; return 1; }
+    if ! set_fail2ban_key "$candidate" ignoreip '%(vps_manager_whitelist)s' ||
+      ! atomic_install_file "$candidate" "$FAIL2BAN_JAIL_FILE" 0644; then
+      rm -f -- "$candidate"; return 1
+    fi
+    rm -f -- "$candidate"
+    timeout 35s fail2ban-client -t
+    return $?
+  fi
+  printf '%s\n' "$details" >&2
+  return 1
+}
+
+apply_fail2ban_candidate() {
+  local candidate="$1" enabled="$2" ports="${3:-}" maxretry="${4:-5}" findtime="${5:-600}" bantime="${6:-3600}"
+  local snapshot had_file=0 was_active=0 was_jail=0 failed=0 disk_rc
+  snapshot="$(mktemp /tmp/vps-manager-jail-old.XXXXXX)" || { rm -f -- "$candidate"; return 1; }
+  if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
+    cp -a -- "$FAIL2BAN_JAIL_FILE" "$snapshot" || { rm -f -- "$candidate" "$snapshot"; return 1; }
+    had_file=1
+  fi
+  [[ ! -L "$FAIL2BAN_JAIL_FILE" ]] || { error "Fail2ban 管理路径是软链接，停止修改。"; rm -f -- "$candidate" "$snapshot"; return 1; }
+  systemctl is-active --quiet fail2ban 2>/dev/null && was_active=1
+  fail2ban-client status "$FAIL2BAN_JAIL" >/dev/null 2>&1 && was_jail=1
+  backup_file "$FAIL2BAN_JAIL_FILE" || failed=1
+  (( failed )) || atomic_install_file "$candidate" "$FAIL2BAN_JAIL_FILE" 0644 || failed=1
+  rm -f -- "$candidate"
+  (( failed )) || validate_fail2ban_configuration || failed=1
+  if (( failed == 0 )); then
+    fail2ban_disk_jail_enabled; disk_rc=$?
+    if [[ "$enabled" == true ]]; then (( disk_rc == 0 )) || failed=1
+    else (( disk_rc == 1 )) || failed=1; fi
+  fi
+  if (( failed == 0 )); then
+    if [[ "$enabled" == true ]]; then
+      if (( was_active )); then
+        if (( was_jail )); then timeout 35s fail2ban-client reload --restart "$FAIL2BAN_JAIL" || failed=1
+        else timeout 35s fail2ban-client reload || failed=1; fi
+      else timeout 35s systemctl start fail2ban || failed=1; fi
+      (( failed )) || wait_for_fail2ban_sshd || failed=1
+      (( failed )) || fail2ban_sshd_rule_matches "$maxretry" "$findtime" "$bantime" || failed=1
+      (( failed )) || fail2ban_effective_ports_match "$ports" || failed=1
+      if (( failed == 0 )) && [[ -n "${8:-}" ]]; then
+        fail2ban_ignored_network_present "$8" || failed=1
+      fi
+    elif (( was_active )); then
+      timeout 35s fail2ban-client reload || failed=1
+      if fail2ban-client status "$FAIL2BAN_JAIL" >/dev/null 2>&1; then failed=1; fi
+    fi
+  fi
+  if (( failed )); then
+    restore_file_snapshot "$snapshot" "$had_file" "$FAIL2BAN_JAIL_FILE" || warn "配置文件恢复失败，请检查备份。"
+    if (( was_active )); then
+      if (( was_jail )) && fail2ban-client status "$FAIL2BAN_JAIL" >/dev/null 2>&1; then
+        timeout 35s fail2ban-client reload --restart "$FAIL2BAN_JAIL" >/dev/null 2>&1 || warn "原 SSH 防护重载失败。"
+      else timeout 35s fail2ban-client reload >/dev/null 2>&1 || warn "原 Fail2ban 配置重载失败。"; fi
+    else timeout 35s systemctl stop fail2ban >/dev/null 2>&1 || true; fi
+    rm -f -- "$snapshot"
+    error "Fail2ban 配置或实际生效状态不符，已尝试恢复；请检查其他 .local 覆盖或自定义封禁动作。"
+    return 1
+  fi
+  rm -f -- "$snapshot"
+  if [[ "$enabled" == true && "${7:-false}" == true ]] && ! systemctl enable fail2ban >/dev/null 2>&1; then
+    warn "防护已运行，但开机启动设置失败，请检查服务状态。"
+    return 1
+  fi
+}
+
+fail2ban_candidate() {
+  local candidate
+  install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")" || return 1
+  candidate="$(mktemp /tmp/vps-manager-jail.XXXXXX)" || return 1
+  if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
+    cp -- "$FAIL2BAN_JAIL_FILE" "$candidate" || { rm -f -- "$candidate"; return 1; }
+  fi
+  printf '%s\n' "$candidate"
+}
+
+sync_fail2ban_ssh_ports() {
+  local ports candidate maxretry findtime bantime
+  command -v fail2ban-client >/dev/null 2>&1 || return 0
+  fail2ban-client status "$FAIL2BAN_JAIL" >/dev/null 2>&1 || return 0
+  ports="$(current_ssh_ports | paste -sd, -)" || return 1
+  [[ -n "$ports" ]] || return 1
+  maxretry="$(fail2ban-client get "$FAIL2BAN_JAIL" maxretry)" || return 1
+  findtime="$(fail2ban-client get "$FAIL2BAN_JAIL" findtime)" || return 1
+  bantime="$(fail2ban-client get "$FAIL2BAN_JAIL" bantime)" || return 1
+  candidate="$(fail2ban_candidate)" || return 1
+  set_fail2ban_key "$candidate" port "$ports" || { rm -f -- "$candidate"; return 1; }
+  apply_fail2ban_candidate "$candidate" true "$ports" "$maxretry" "$findtime" "$bantime" || return 1
+  ok "Fail2ban 已核对运行中的封禁动作，覆盖 SSH TCP 端口 ${ports}。"
+}
+
 enable_fail2ban() {
-  local ports backup="" temporary enabled_ok=1
+  local ports candidate key value
   require_root
   require_ubuntu || return 1
-  ports="$(current_ssh_ports | paste -sd, -)" || {
-    error "无法识别当前 SSH 端口，拒绝配置 Fail2ban。"
-    return 1
-  }
-  [[ -n "$ports" ]] || { error "当前 SSH 端口为空。"; return 1; }
-  info "将安装 Fail2ban，并保护当前 SSH TCP 端口：${ports}。"
-  confirm "确认安装并启用 SSH 防暴力破解？" || return 0
+  ports="$(current_ssh_ports | paste -sd, -)" || return 1
+  [[ -n "$ports" ]] || return 1
+  info "Fail2ban 用于拦截重复失败的 SSH 登录，不是网站或 DDoS 防护。"
+  info "将启用 SSH 端口 ${ports} 的防护：10 分钟内失败 5 次，封禁 1 小时。"
+  if fail2ban-client status "$FAIL2BAN_JAIL" >/dev/null 2>&1; then
+    info 'SSH 防护已经运行；如需调整规则，请使用安全菜单中的「调整规则」。'
+    show_fail2ban_status
+    return 0
+  fi
+  confirm "确认安装并启用？" || return 0
   acquire_lock || return 1
   log_command interactive apt-get update || return 1
-  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban python3-systemd || return 1
-  install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")"
-  if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
-    install -d -m 0700 "$BACKUP_ROOT" || return 1
-    backup="${BACKUP_ROOT}/etc_fail2ban_jail.d_vps-manager-sshd.local.bak.$(date '+%Y%m%d-%H%M%S').$$"
-    cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { error "无法备份现有 Fail2ban 配置。"; return 1; }
-  fi
-  temporary="$(mktemp /tmp/vps-manager-fail2ban-config.XXXXXX)" || return 1
-  {
-    printf '[sshd]\n'
-    printf 'enabled = true\n'
-    printf 'port = %s\n' "$ports"
-    printf 'backend = systemd\n'
-    printf 'maxretry = 5\n'
-    printf 'findtime = 10m\n'
-    printf 'bantime = 1h\n'
-  } > "$temporary" || { rm -f -- "$temporary"; return 1; }
-  if ! atomic_install_file "$temporary" "$FAIL2BAN_JAIL_FILE" 0644; then
-    rm -f -- "$temporary"
-    error "无法写入 Fail2ban 配置。"
-    return 1
-  fi
-  rm -f -- "$temporary"
-  if ! fail2ban-client -t; then
-    if [[ -n "$backup" ]]; then cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE"; else rm -f -- "$FAIL2BAN_JAIL_FILE"; fi
-    error "Fail2ban 配置测试失败，已恢复。"
-    return 1
-  fi
-  systemctl enable fail2ban >/dev/null 2>&1 || enabled_ok=0
-  if ! systemctl restart fail2ban || ! wait_for_fail2ban_sshd || ! fail2ban_sshd_rule_matches; then
-    if [[ -n "$backup" ]]; then cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE"; else rm -f -- "$FAIL2BAN_JAIL_FILE"; fi
-    systemctl restart fail2ban >/dev/null 2>&1 || true
-    wait_for_fail2ban_sshd || true
-    error "Fail2ban 启动、jail 就绪或规则生效验证失败，已恢复原配置。"
-    return 1
-  fi
-  if (( enabled_ok == 0 )); then
-    warn "Fail2ban 当前已运行且规则已生效，但开机启动设置失败，请检查 systemctl 状态。"
-    show_fail2ban_status
-    return 1
-  fi
-  ok "Fail2ban SSH 防护已启用并验证：5 次失败/10 分钟，封禁 1 小时。"
-  log_line "fail2ban sshd enabled and verified on ports ${ports}"
+  log_command interactive env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y fail2ban python3-systemd || return 1
+  candidate="$(fail2ban_candidate)" || return 1
+  while read -r key value; do
+    set_fail2ban_key "$candidate" "$key" "$value" || { rm -f -- "$candidate"; return 1; }
+  done <<EOF
+ enabled true
+ filter sshd
+ port ${ports}
+ protocol tcp
+ backend systemd
+ maxretry 5
+ findtime 600
+ bantime 3600
+EOF
+  apply_fail2ban_candidate "$candidate" true "$ports" 5 600 3600 true || return 1
+  ok "SSH 防护已启用，运行中的规则及封禁端口已核对。"
+  log_line "fail2ban sshd enabled on verified ports ${ports}"
   show_fail2ban_status
 }
 
 disable_fail2ban() {
-  local backup
+  local candidate
   require_root
   require_ubuntu || return 1
-  [[ -f "$FAIL2BAN_JAIL_FILE" ]] || { info "未发现 vps-manager 管理的 Fail2ban SSH jail。"; return 0; }
-  warn "只会移除 vps-manager 的 SSH jail，不卸载 Fail2ban，也不删除其他 jail。"
-  confirm "确认关闭该 SSH jail？" || return 0
+  command -v fail2ban-client >/dev/null 2>&1 || { info "未安装 Fail2ban。"; return 0; }
+  warn "将明确停用 sshd 防护，包括其他配置启用的同名 jail；其他 jail 不变，也不卸载软件。"
+  confirm "确认关闭 SSH 防护？" || return 0
   acquire_lock || return 1
-  backup="$(mktemp /tmp/vps-manager-fail2ban.XXXXXX)" || return 1
-  cp -a -- "$FAIL2BAN_JAIL_FILE" "$backup" || { rm -f -- "$backup"; return 1; }
-  rm -f -- "$FAIL2BAN_JAIL_FILE"
-  if command -v fail2ban-client >/dev/null 2>&1 && ! systemctl restart fail2ban; then
-    cp -a -- "$backup" "$FAIL2BAN_JAIL_FILE" || true
-    systemctl restart fail2ban >/dev/null 2>&1 || true
-    rm -f -- "$backup"
-    error "Fail2ban 重启失败，已恢复 SSH jail。"
-    return 1
+  candidate="$(fail2ban_candidate)" || return 1
+  set_fail2ban_key "$candidate" enabled false || { rm -f -- "$candidate"; return 1; }
+  apply_fail2ban_candidate "$candidate" false || return 1
+  ok "SSH 防护已关闭；配置合并结果与运行状态均已核对。"
+  log_line "fail2ban sshd explicitly disabled and verified"
+}
+
+configure_fail2ban_rules() {
+  local retry window_minutes ban_minutes candidate ports key value
+  require_root
+  require_ubuntu || return 1
+  fail2ban-client status "$FAIL2BAN_JAIL" >/dev/null 2>&1 || { error "请先启用 SSH 防护。"; return 1; }
+  show_fail2ban_status
+  read -r -p "允许失败次数 [5]：" retry || return 1
+  read -r -p "统计多少分钟内的失败 [10]：" window_minutes || return 1
+  read -r -p "封禁多少分钟 [60]：" ban_minutes || return 1
+  retry="${retry:-5}"; window_minutes="${window_minutes:-10}"; ban_minutes="${ban_minutes:-60}"
+  [[ "$retry" =~ ^[0-9]{1,2}$ && "$window_minutes" =~ ^[0-9]{1,4}$ && "$ban_minutes" =~ ^[0-9]{1,5}$ ]] || { error "请输入整数。"; return 1; }
+  retry="$((10#$retry))"; window_minutes="$((10#$window_minutes))"; ban_minutes="$((10#$ban_minutes))"
+  (( retry>=1 && retry<=20 && window_minutes>=1 && window_minutes<=1440 && ban_minutes>=1 && ban_minutes<=10080 )) || {
+    error "次数应为 1–20，统计窗口 1–1440 分钟，封禁 1–10080 分钟。"; return 1;
+  }
+  confirm "设置为 ${window_minutes} 分钟内失败 ${retry} 次，封禁 ${ban_minutes} 分钟？" || return 0
+  acquire_lock || return 1
+  ports="$(current_ssh_ports | paste -sd, -)" || return 1
+  candidate="$(fail2ban_candidate)" || return 1
+  while read -r key value; do
+    set_fail2ban_key "$candidate" "$key" "$value" || { rm -f -- "$candidate"; return 1; }
+  done <<EOF
+ maxretry ${retry}
+ findtime $((window_minutes*60))
+ bantime $((ban_minutes*60))
+ port ${ports}
+EOF
+  apply_fail2ban_candidate "$candidate" true "$ports" "$retry" "$((window_minutes*60))" "$((ban_minutes*60))" || return 1
+  show_fail2ban_status
+}
+
+normalize_ip_network() {
+  python3 -c 'import ipaddress,sys; print(ipaddress.ip_network(sys.argv[1], strict=False))' "$1" 2>/dev/null
+}
+
+fail2ban_ignored_network_present() {
+  local wanted="$1" raw token normalized
+  raw="$(fail2ban-client get "$FAIL2BAN_JAIL" ignoreip 2>/dev/null)" || return 1
+  raw="$(printf '%s' "$raw" | tr "[],'|" '     ')"
+  for token in $raw; do
+    [[ "$token" == *.* || "$token" == *:* ]] || continue
+    normalized="$(normalize_ip_network "$token")" || continue
+    [[ "$normalized" != "$wanted" ]] || return 0
+  done
+  return 1
+}
+
+edit_fail2ban_whitelist() {
+  local operation="$1" address normalized current="" entry candidate ports maxretry findtime bantime expected_network=""
+  local -a entries=() result=()
+  require_root
+  require_ubuntu || return 1
+  fail2ban-client status "$FAIL2BAN_JAIL" >/dev/null 2>&1 || { error "请先启用 SSH 防护。"; return 1; }
+  fail2ban-client get "$FAIL2BAN_JAIL" ignoreip || return 1
+  info "只管理通过本工具添加的可信 IP；系统原有白名单继续保留。"
+  read -r -p "可信 IP 或网段（例如 203.0.113.8；留空取消）：" address || return 1
+  [[ -n "$address" ]] || return 0
+  normalized="$(normalize_ip_network "$address")" || { error "IP 或网段格式不正确。"; return 1; }
+  [[ "$normalized" != */0 ]] || { error "不能把整个互联网加入白名单。"; return 1; }
+  if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then
+    current="$(awk -F= '/^[[:space:]]*ignoreip[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$FAIL2BAN_JAIL_FILE")"
   fi
-  rm -f -- "$backup"
-  ok "vps-manager 的 Fail2ban SSH jail 已移除。"
+  if [[ "$current" == *'%(vps_manager_whitelist)s'* ]]; then
+    current="$(awk '/^[[:space:]]*vps_manager_whitelist[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$FAIL2BAN_JAIL_FILE")"
+  elif [[ -n "$current" && "$current" != '%(known/ignoreip)s'* ]]; then
+    error "管理文件已有手工白名单，为保留原设置，请手动整理该行后再使用此菜单。"
+    return 1
+  else
+    current="${current#'%(known/ignoreip)s'}"
+  fi
+  read -r -a entries <<< "$current"
+  for entry in "${entries[@]}"; do [[ "$entry" == "$normalized" ]] || result+=("$entry"); done
+  if [[ "$operation" == add ]]; then result+=("$normalized"); fi
+  printf '本工具保留的可信地址：%s\n' "${result[*]:-无}"
+  warn "白名单地址不会因失败登录被本 jail 自动封禁；仅添加你信任且稳定的来源。"
+  confirm "确认更新白名单？" || return 0
+  acquire_lock || return 1
+  candidate="$(fail2ban_candidate)" || return 1
+  set_fail2ban_key "$candidate" vps_manager_whitelist "${result[*]}" || { rm -f -- "$candidate"; return 1; }
+  set_fail2ban_key "$candidate" ignoreip '%(known/ignoreip)s %(vps_manager_whitelist)s' || { rm -f -- "$candidate"; return 1; }
+  ports="$(current_ssh_ports | paste -sd, -)" || { rm -f -- "$candidate"; return 1; }
+  maxretry="$(fail2ban-client get "$FAIL2BAN_JAIL" maxretry)" || { rm -f -- "$candidate"; return 1; }
+  findtime="$(fail2ban-client get "$FAIL2BAN_JAIL" findtime)" || { rm -f -- "$candidate"; return 1; }
+  bantime="$(fail2ban-client get "$FAIL2BAN_JAIL" bantime)" || { rm -f -- "$candidate"; return 1; }
+  [[ "$operation" != add ]] || expected_network="$normalized"
+  apply_fail2ban_candidate "$candidate" true "$ports" "$maxretry" "$findtime" "$bantime" false "$expected_network" || return 1
+  ok "白名单配置已更新。继承自系统其他文件的可信地址不会被此菜单删除。"
+  fail2ban-client get "$FAIL2BAN_JAIL" ignoreip
+}
+
+unban_fail2ban_ip() {
+  local address
+  require_root
+  require_ubuntu || return 1
+  fail2ban-client status "$FAIL2BAN_JAIL" >/dev/null 2>&1 || { error "SSH 防护未运行。"; return 1; }
+  show_fail2ban_status
+  read -r -p "要解封的单个 IP（留空取消）：" address || return 1
+  [[ -n "$address" ]] || return 0
+  validate_ipv4 "$address" || validate_ipv6 "$address" || { error "请输入有效的单个 IP，不能填写网段。"; return 1; }
+  confirm "确认从 SSH jail 解封 ${address}？" || return 0
+  acquire_lock || return 1
+  fail2ban-client set "$FAIL2BAN_JAIL" unbanip "$address" || return 1
+  ok "已执行解封；如后续仍持续登录失败，该地址可能再次被封禁。"
+  show_fail2ban_status
 }
 
 show_auto_updates_status() {
-  local list_state="未启用" upgrade_state="未启用" reboot_state="未明确关闭" timer_state="异常"
+  local list_state="未启用" upgrade_state="未启用" reboot_state="未明确关闭" timer_state="异常" effective
   if ! dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -q 'install ok installed'; then
     printf '自动安全更新：未安装\n'
     return 0
   fi
-  grep -q 'APT::Periodic::Update-Package-Lists "1";' "$AUTO_UPGRADES_FILE" 2>/dev/null && list_state="每天"
-  grep -q 'APT::Periodic::Unattended-Upgrade "1";' "$AUTO_UPGRADES_FILE" 2>/dev/null && upgrade_state="每天"
-  grep -q 'Unattended-Upgrade::Automatic-Reboot "false";' "$AUTO_UPGRADES_OPTIONS_FILE" 2>/dev/null && reboot_state="关闭"
+  effective="$(apt-config dump 2>/dev/null)" || { warn "无法读取 APT 生效配置。"; return 1; }
+  grep -q 'APT::Periodic::Update-Package-Lists "1";' <<< "$effective" && list_state="每天"
+  grep -q 'APT::Periodic::Unattended-Upgrade "1";' <<< "$effective" && upgrade_state="每天"
+  grep -q 'Unattended-Upgrade::Automatic-Reboot "false";' <<< "$effective" && reboot_state="关闭"
   if systemctl is-active --quiet apt-daily.timer 2>/dev/null && systemctl is-active --quiet apt-daily-upgrade.timer 2>/dev/null; then
     timer_state="正常"
   fi
@@ -2105,13 +2503,17 @@ security_menu() {
   while true; do
     printf '\n安全防护：\n'
     printf '  1. 查看 Fail2ban 状态\n'
-    printf '  2. 安装/更新并启用 Fail2ban SSH jail\n'
-    printf '  3. 关闭 vps-manager 的 Fail2ban SSH jail\n'
+    printf '  2. 安装并启用 SSH 防护（推荐默认规则）\n'
+    printf '  3. 关闭 SSH 防护（不影响其他 jail）\n'
     printf '  4. 查看自动安全更新状态\n'
     printf '  5. 安装并启用自动安全更新\n'
     printf '  6. 关闭自动安全更新\n'
+    printf '  7. 调整 SSH 防护规则\n'
+    printf '  8. 添加可信 IP / 网段\n'
+    printf '  9. 移除本工具添加的可信 IP / 网段\n'
+    printf ' 10. 解封单个 IP\n'
     printf '  0. 返回\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) show_fail2ban_status; pause ;;
       2) enable_fail2ban; pause ;;
@@ -2119,6 +2521,10 @@ security_menu() {
       4) show_auto_updates_status; pause ;;
       5) enable_auto_updates; pause ;;
       6) disable_auto_updates; pause ;;
+      7) configure_fail2ban_rules; pause ;;
+      8) edit_fail2ban_whitelist add; pause ;;
+      9) edit_fail2ban_whitelist remove; pause ;;
+      10) unban_fail2ban_ip; pause ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -2301,7 +2707,7 @@ install_docker_official() {
     if [[ -f "$DOCKER_KEY_FILE" ]]; then cp -a -- "$DOCKER_KEY_FILE" "$key_snapshot" || { rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"; return 1; }; had_key=1; fi
     if [[ -f "$DOCKER_SOURCE_FILE" ]]; then cp -a -- "$DOCKER_SOURCE_FILE" "$source_snapshot" || { rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"; return 1; }; had_source=1; fi
 
-    if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$key_candidate" ||
+    if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" --max-time "$DOWNLOAD_TOTAL_TIMEOUT" --retry 2 --retry-delay 2 -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$key_candidate" ||
        ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$key_candidate"; then
       rm -f -- "$key_candidate" "$source_candidate" "$key_snapshot" "$source_snapshot"
       error "Docker 官方 GPG key 下载或格式检查失败。"
@@ -2394,8 +2800,9 @@ add_user_to_docker_group() {
   warn "docker 组成员可以控制 Docker daemon，权限实际等同 root。"
   confirm "确认将 ${username} 加入 docker 组？" || return 0
   acquire_lock || return 1
-  groupadd -f docker
-  usermod -aG docker "$username"
+  groupadd -f docker || { error "无法创建 docker 组。"; return 1; }
+  usermod -aG docker "$username" || { error "添加 docker 组成员失败。"; return 1; }
+  id -nG "$username" | tr ' ' '\n' | grep -Fxq docker || { error "未检测到 docker 组成员关系。"; return 1; }
   ok "${username} 已加入 docker 组；需要重新登录后生效。"
 }
 
@@ -2418,7 +2825,7 @@ docker_menu() {
     printf '  3. 将现有用户加入 docker 组\n'
     printf '  4. 运行 hello-world 测试\n'
     printf '  0. 返回\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) show_docker_status; pause ;;
       2) install_docker_official; pause ;;
@@ -2549,7 +2956,7 @@ system_menu() {
     printf '  5. 查看是否需要重启\n'
     printf '  6. 立即重启\n'
     printf '  0. 返回\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     case "$choice" in
       1) system_upgrade; pause ;;
       2) set_hostname; pause ;;
@@ -2609,64 +3016,48 @@ init_wizard() {
 }
 
 update_manager() {
-  local timestamp installer installer_url source_url rc backup="" new_version=""
+  local installer installer_url source_url helper_url rc new_version remote_version
   require_root
   validate_manager_paths || return 1
   acquire_lock || return 1
   ensure_command curl curl || return 1
-
-  timestamp="$(date +%s)"
-  installer_url="${MANAGER_RAW_BASE}/install.sh?ts=${timestamp}"
-  source_url="${MANAGER_RAW_BASE}/vps-manager.sh?ts=${timestamp}"
+  installer_url="${MANAGER_RAW_BASE}/install.sh"
+  source_url="${MANAGER_RAW_BASE}/vps-manager.sh"
+  helper_url="${MANAGER_RAW_BASE}/network-rollback.sh"
   installer="$(mktemp /tmp/vps-manager-bootstrap.XXXXXX.sh)" || return 1
-  if [[ -f "$INSTALL_PATH" ]]; then
-    backup="$(mktemp /tmp/vps-manager-current.XXXXXX.sh)" || { rm -f -- "$installer"; return 1; }
-    cp -a -- "$INSTALL_PATH" "$backup" || { rm -f -- "$installer" "$backup"; return 1; }
-  fi
-
-  info "正在检查 ${MANAGER_REPO}@${MANAGER_REF} 的管理器版本..."
-  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$installer_url" -o "$installer"; then
-    rm -f "$installer" "$backup"
-    error "无法下载 GitHub 引导安装器。"
+  info "正在检查 ${MANAGER_REPO}@${MANAGER_REF} 的完整版本..."
+  if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT" \
+    --max-time "$DOWNLOAD_TOTAL_TIMEOUT" --retry 2 --retry-delay 2 -fsSL "$installer_url" -o "$installer"; then
+    rm -f -- "$installer"
+    error "下载安装器失败，当前版本未修改。"
     return 1
   fi
   if ! bash -n "$installer" || ! grep -q '^# Bootstrap installer for vps-manager\.$' "$installer"; then
-    rm -f "$installer" "$backup"
-    error "下载内容未通过安装器校验，拒绝更新。"
+    rm -f -- "$installer"
+    error "安装器内容或语法不正确，拒绝更新。"
     return 1
   fi
-
-  VPS_MANAGER_REPO="$MANAGER_REPO" \
-    VPS_MANAGER_REF="$MANAGER_REF" \
-    VPS_MANAGER_SOURCE_URL="$source_url" \
-    VPS_MANAGER_INSTALL_PATH="$INSTALL_PATH" \
-    VPS_MANAGER_ALIAS_PATH="$ALIAS_PATH" \
+  remote_version="$(awk -F '\"' '/^VERSION=/{print $2; exit}' "$installer")"
+  if [[ ! "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    [[ "$(printf '%s\n' "$VERSION" "$remote_version" | sort -V | head -n1)" != "$VERSION" ]]; then
+    rm -f -- "$installer"
+    error "远程安装器版本 ${remote_version:-未知} 低于当前 ${VERSION} 或无法验证，已停止更新。"
+    info "如果你还没有上传本次源码，请先把完整版本上传到自己的 GitHub 仓库。"
+    return 1
+  fi
+  VPS_MANAGER_REPO="$MANAGER_REPO" VPS_MANAGER_REF="$MANAGER_REF" \
+    VPS_MANAGER_SOURCE_URL="$source_url" VPS_MANAGER_ROLLBACK_SOURCE_URL="$helper_url" \
+    VPS_MANAGER_INSTALL_PATH="$INSTALL_PATH" VPS_MANAGER_ROLLBACK_HELPER="$ROLLBACK_HELPER" \
+    VPS_MANAGER_ALIAS_PATH="$ALIAS_PATH" VPS_MANAGER_LOCK_FILE="$LOCK_FILE" \
     bash "$installer" version
   rc=$?
-  rm -f "$installer"
-
+  rm -f -- "$installer"
   if (( rc != 0 )); then
-    if [[ -n "$backup" && -s "$backup" ]]; then
-      install -m 0755 "$backup" "$INSTALL_PATH" || true
-    fi
-    rm -f -- "$backup"
-    error "vps-manager 更新失败。"
+    error "更新失败；安装器会对主程序和恢复程序一起尝试恢复，详情见以上输出。"
     return "$rc"
   fi
-  new_version="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}')"
-  if [[ ! "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-     [[ "$(printf '%s\n' "$VERSION" "$new_version" | sort -V | head -n 1)" != "$VERSION" ]]; then
-    if [[ -n "$backup" && -s "$backup" ]]; then
-      install -m 0755 "$backup" "$INSTALL_PATH" || true
-    else
-      rm -f -- "$INSTALL_PATH"
-    fi
-    rm -f -- "$backup"
-    error "远程版本 ${new_version:-未知} 低于或无法验证当前版本 ${VERSION}，已拒绝降级并恢复。"
-    return 1
-  fi
-  rm -f "$backup"
-  ok "vps-manager 更新完成：${VERSION} -> ${new_version}"
+  new_version="$("$INSTALL_PATH" version 2>/dev/null)" || return 1
+  ok "更新完成：${new_version}；现有 SSH、防火墙等配置保持原样。"
 }
 
 main_menu() {
@@ -2695,7 +3086,7 @@ main_menu() {
     printf ' 12. 保守系统清理\n'
     printf ' 13. 更新 vps-manager\n'
     printf '  0. 退出\n'
-    read -r -p "请选择：" choice
+    read -r -p "请选择：" choice || return 0
     printf '\n'
     case "$choice" in
       1) init_wizard; pause ;;
@@ -2739,6 +3130,7 @@ main() {
     check-ai|check-media) check_service_access ;;
     cleanup-system) safe_system_cleanup ;;
     update|update-manager) update_manager ;;
+    confirm-network) confirm_pending_network ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|--help|-h) show_help ;;
     *) error "未知命令：${subcommand}"; show_help; return 2 ;;

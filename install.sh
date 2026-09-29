@@ -1,206 +1,176 @@
 #!/usr/bin/env bash
 # Bootstrap installer for vps-manager.
-
 set -uo pipefail
 umask 077
-
-VERSION="1.4.4"
+VERSION="1.5.0"
 DEFAULT_REPO="BBMCoin04/mb-linux"
 REPO="${VPS_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${VPS_MANAGER_REF:-main}"
 INSTALL_PATH="${VPS_MANAGER_INSTALL_PATH:-/usr/local/sbin/vps-manager}"
+HELPER_PATH="${VPS_MANAGER_ROLLBACK_HELPER:-${INSTALL_PATH}.rollback}"
 ALIAS_PATH="${VPS_MANAGER_ALIAS_PATH:-/usr/local/sbin/lm}"
-CACHE_BUST="$(date +%s)"
-SOURCE_URL="${VPS_MANAGER_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/vps-manager.sh?ts=${CACHE_BUST}}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
-BUNDLED_SOURCE=""
-if [[ -z "${VPS_MANAGER_SOURCE_URL+x}" && -n "$SCRIPT_DIR" && -s "${SCRIPT_DIR}/vps-manager.sh" ]]; then
-  BUNDLED_SOURCE="${SCRIPT_DIR}/vps-manager.sh"
-fi
-TEMP_FILE=""
-BACKUP_FILE=""
-ALIAS_CREATED=0
-INSTALL_CHANGED=0
+LOCK_FILE="${VPS_MANAGER_LOCK_FILE:-/run/lock/vps-manager.lock}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+WORK_DIR=""
 COMMITTED=0
+ALIAS_CREATED=0
+LOCK_INHERITED=0
+MODIFIED_COUNT=0
+TARGETS=()
+STAGED=()
+HAD_FILE=()
 
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-  C_RED=$'\033[31m'
-  C_GREEN=$'\033[32m'
-  C_CYAN=$'\033[36m'
-  C_RESET=$'\033[0m'
-else
-  C_RED=""
-  C_GREEN=""
-  C_CYAN=""
-  C_RESET=""
-fi
+info() { printf '[信息] %s\n' "$*"; }
+error() { printf '[错误] %s\n' "$*" >&2; }
+installer_require_root() { (( EUID == 0 )); }
 
-info() { printf '%s[信息]%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
-ok() { printf '%s[完成]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-error() { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
-
-restore_manager() {
-  if [[ -n "$BACKUP_FILE" && -s "$BACKUP_FILE" ]]; then
-    install -m 0755 "$BACKUP_FILE" "$INSTALL_PATH" || true
-  else
-    rm -f -- "$INSTALL_PATH"
-  fi
-  (( ALIAS_CREATED == 0 )) || rm -f -- "$ALIAS_PATH"
+valid_target() {
+  [[ "$1" == /* && "$1" != *[[:space:]]* && ! -L "$1" && ( ! -e "$1" || -f "$1" ) ]]
 }
 
-cleanup() {
-  local rc=$?
-  if (( INSTALL_CHANGED == 1 && COMMITTED == 0 )); then
-    restore_manager
+trusted_bundle() {
+  local file owner mode invoking_uid="${SUDO_UID:-$EUID}"
+  [[ -z "${VPS_MANAGER_SOURCE_URL+x}" ]] || return 1
+  for file in "$SCRIPT_DIR" "$SCRIPT_DIR/vps-manager.sh" "$SCRIPT_DIR/network-rollback.sh"; do
+    [[ -e "$file" && ! -L "$file" ]] || return 1
+    owner="$(stat -c %u "$file")" || return 1
+    mode="$(stat -c %a "$file")" || return 1
+    [[ "$owner" == 0 || "$owner" == "$invoking_uid" ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+  done
+}
+
+fetch_source() {
+  local url="$1" target="$2"
+  [[ "$url" == https://* ]] || { error "只允许 HTTPS 下载。"; return 1; }
+  if command -v curl >/dev/null 2>&1; then
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 10 --max-time 90 \
+      --retry 2 --retry-delay 2 -fsSL "$url" -o "$target"
+  elif command -v wget >/dev/null 2>&1; then
+    timeout 120s wget --https-only --timeout=20 --tries=2 -qO "$target" "$url"
+  else
+    error "需要 curl 或 wget 才能下载。"
+    return 1
   fi
-  [[ -z "$TEMP_FILE" ]] || rm -f -- "$TEMP_FILE"
-  [[ -z "$BACKUP_FILE" ]] || rm -f -- "$BACKUP_FILE"
+}
+
+installer_cleanup() {
+  local rc=$? index temporary failed=0
+  if (( COMMITTED == 0 )); then
+    for (( index=MODIFIED_COUNT-1; index>=0; index-- )); do
+      if [[ "${HAD_FILE[$index]}" == 1 ]]; then
+        temporary="$(mktemp "$(dirname "${TARGETS[$index]}")/.vps-restore.XXXXXX")" || { failed=1; continue; }
+        if ! cp -a -- "$WORK_DIR/backup-$index" "$temporary" || ! mv -f -- "$temporary" "${TARGETS[$index]}"; then
+          failed=1
+          rm -f -- "$temporary"
+        fi
+      else
+        rm -f -- "${TARGETS[$index]}" || failed=1
+      fi
+    done
+    (( ALIAS_CREATED == 0 )) || rm -f -- "$ALIAS_PATH" || failed=1
+  fi
+  for temporary in "${STAGED[@]}"; do rm -f -- "$temporary"; done
+  if (( failed )); then
+    error "自动恢复不完整，请保留备份目录并手动检查：${WORK_DIR}"
+    return 1
+  fi
+  [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
   return "$rc"
 }
 
-on_signal() {
-  trap - HUP INT TERM
-  exit "$1"
-}
-
-trap cleanup EXIT
-trap 'on_signal 129' HUP
-trap 'on_signal 130' INT
-trap 'on_signal 143' TERM
-
-if (( EUID != 0 )); then
-  error "安装需要 root 权限，请在命令前使用 sudo。"
-  exit 1
-fi
-if [[ "$INSTALL_PATH" != /* || "$INSTALL_PATH" == *[[:space:]]* ]]; then
-  error "管理器安装路径必须是不含空白的绝对路径。"
-  exit 1
-fi
-if [[ -n "$ALIAS_PATH" && ( "$ALIAS_PATH" != /* || "$ALIAS_PATH" == *[[:space:]]* || "$ALIAS_PATH" == "$INSTALL_PATH" ) ]]; then
-  error "快捷命令路径必须是不含空白且不同于安装路径的绝对路径。"
-  exit 1
-fi
-
-for command_name in install bash; do
-  if ! command -v "$command_name" >/dev/null 2>&1; then
-    error "缺少必要命令：${command_name}"
-    exit 1
+installer_main() {
+  local command_name manager_version helper_version current_version="" index source_url helper_url
+  installer_require_root || { error "请使用 sudo bash install.sh。"; return 1; }
+  for command_name in install bash mktemp flock stat sort timeout; do
+    command -v "$command_name" >/dev/null 2>&1 || { error "缺少命令：${command_name}"; return 1; }
+  done
+  valid_target "$INSTALL_PATH" && valid_target "$HELPER_PATH" && [[ "$INSTALL_PATH" != "$HELPER_PATH" ]] || {
+    error "程序和恢复程序路径必须是不含空白、互不相同的普通绝对文件路径。"; return 1;
+  }
+  if [[ -n "$ALIAS_PATH" ]]; then
+    [[ "$ALIAS_PATH" == /* && "$ALIAS_PATH" != *[[:space:]]* && "$ALIAS_PATH" != "$INSTALL_PATH" && "$ALIAS_PATH" != "$HELPER_PATH" ]] || return 1
+    if [[ ( -e "$ALIAS_PATH" || -L "$ALIAS_PATH" ) && "$(readlink -f "$ALIAS_PATH" 2>/dev/null)" != "$INSTALL_PATH" ]]; then
+      error "快捷命令已被其他程序占用：${ALIAS_PATH}"; return 1
+    fi
   fi
-done
-if [[ -z "$BUNDLED_SOURCE" && "$SOURCE_URL" != https://* ]]; then
-  error "仅允许从 HTTPS 地址下载主程序。"
-  exit 1
-fi
+  [[ "$LOCK_FILE" == /* && "$LOCK_FILE" != *[[:space:]]* && ! -L "$LOCK_FILE" ]] || return 1
+  install -d -m 0755 "$(dirname "$LOCK_FILE")" || return 1
+  if [[ "$(readlink /proc/self/fd/9 2>/dev/null || true)" == "$LOCK_FILE" ]]; then LOCK_INHERITED=1
+  else exec 9>"$LOCK_FILE" || return 1; fi
+  flock -n 9 || { error "另一个安装或管理任务正在运行。"; return 1; }
 
-TEMP_FILE="$(mktemp /tmp/vps-manager.XXXXXX.sh)" || exit 1
-info "vps-manager 引导安装器 ${VERSION}"
-if [[ -n "$BUNDLED_SOURCE" ]]; then
-  info "正在使用安装包内的 vps-manager.sh"
-  if ! cp "$BUNDLED_SOURCE" "$TEMP_FILE"; then
-    error "无法读取安装包内的主程序。"
-    exit 1
-  fi
-else
-  info "正在下载 ${SOURCE_URL}"
-  if command -v curl >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$SOURCE_URL" -o "$TEMP_FILE"
-    download_rc=$?
-  elif command -v wget >/dev/null 2>&1; then
-    wget --https-only -qO "$TEMP_FILE" "$SOURCE_URL"
-    download_rc=$?
+  WORK_DIR="$(mktemp -d /tmp/vps-manager-install.XXXXXXXX)" || return 1
+  trap installer_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  info "vps-manager ${VERSION} 安装器"
+  if trusted_bundle; then
+    info "使用同目录的完整本地源码，不联网下载。"
+    cp -- "$SCRIPT_DIR/vps-manager.sh" "$WORK_DIR/manager" && cp -- "$SCRIPT_DIR/network-rollback.sh" "$WORK_DIR/helper" || return 1
   else
-    error "需要 curl 或 wget 才能下载安装。"
-    exit 1
+    info "下载同一仓库引用的程序和恢复程序（不使用公共临时目录中的旁置脚本）。"
+    source_url="${VPS_MANAGER_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/vps-manager.sh}"
+    helper_url="${VPS_MANAGER_ROLLBACK_SOURCE_URL:-https://raw.githubusercontent.com/${REPO}/${REF}/network-rollback.sh}"
+    fetch_source "$source_url" "$WORK_DIR/manager" && fetch_source "$helper_url" "$WORK_DIR/helper" || return 1
   fi
-  if (( download_rc != 0 )); then
-    error "下载失败，请检查仓库地址和网络。"
-    exit 1
+  for command_name in manager helper; do
+    if [[ ! -s "$WORK_DIR/$command_name" ]] || ! bash -n "$WORK_DIR/$command_name"; then
+      error "下载内容为空或语法错误。"; return 1
+    fi
+  done
+  if ! grep -q '^PROGRAM="vps-manager"$' "$WORK_DIR/manager" ||
+    ! grep -q '^PROGRAM="vps-manager-network-rollback"$' "$WORK_DIR/helper"; then
+    error "程序标识不匹配。"; return 1
   fi
-fi
+  manager_version="$(awk -F '"' '/^VERSION=/{print $2; exit}' "$WORK_DIR/manager")"
+  helper_version="$(awk -F '"' '/^VERSION=/{print $2; exit}' "$WORK_DIR/helper")"
+  [[ "$manager_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$manager_version" == "$helper_version" && "$manager_version" == "$VERSION" ]] || {
+    error "安装器、主程序和恢复程序版本不一致；请取得完整的同一版本。"; return 1;
+  }
+  if [[ -x "$INSTALL_PATH" ]]; then
+    current_version="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}')"
+    if [[ "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$(printf '%s\n' "$current_version" "$manager_version" | sort -V | head -n1)" != "$current_version" ]]; then
+      error "拒绝用 ${manager_version} 覆盖较新的 ${current_version}。"; return 1
+    fi
+  fi
 
-if [[ ! -s "$TEMP_FILE" ]]; then
-  error "下载结果为空，拒绝安装。"
-  exit 1
-fi
-if ! bash -n "$TEMP_FILE"; then
-  error "下载的脚本未通过 Bash 语法检查，拒绝安装。"
-  exit 1
-fi
-if ! grep -q '^PROGRAM="vps-manager"$' "$TEMP_FILE"; then
-  error "下载内容不是预期的 vps-manager 主程序，拒绝安装。"
-  exit 1
-fi
-MANAGER_VERSION="$(awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' "$TEMP_FILE")"
-if [[ ! "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  error "无法识别管理器版本，拒绝安装。"
-  exit 1
-fi
-if [[ -x "$INSTALL_PATH" ]]; then
-  EXISTING_VERSION="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
-  if [[ "$EXISTING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
-     [[ "$(printf '%s\n' "$EXISTING_VERSION" "$MANAGER_VERSION" | sort -V | head -n 1)" != "$EXISTING_VERSION" ]]; then
-    error "拒绝用 ${MANAGER_VERSION} 覆盖已安装的新版本 ${EXISTING_VERSION}。"
-    exit 1
+  TARGETS=("$HELPER_PATH" "$INSTALL_PATH")
+  local -a sources=("$WORK_DIR/helper" "$WORK_DIR/manager")
+  for index in 0 1; do
+    install -d -m 0755 "$(dirname "${TARGETS[$index]}")" || return 1
+    HAD_FILE[index]=0
+    if [[ -f "${TARGETS[$index]}" ]]; then
+      cp -a -- "${TARGETS[$index]}" "$WORK_DIR/backup-$index" || return 1
+      HAD_FILE[index]=1
+    fi
+    STAGED[index]="$(mktemp "$(dirname "${TARGETS[$index]}")/.vps-install.XXXXXX")" || return 1
+    install -m 0755 "${sources[$index]}" "${STAGED[$index]}" || return 1
+  done
+  for index in 0 1; do
+    MODIFIED_COUNT=$((index+1))
+    mv -f -- "${STAGED[$index]}" "${TARGETS[$index]}" || return 1
+  done
+  if [[ -n "$ALIAS_PATH" && ! -e "$ALIAS_PATH" && ! -L "$ALIAS_PATH" ]]; then
+    install -d -m 0755 "$(dirname "$ALIAS_PATH")" || return 1
+    ln -s "$INSTALL_PATH" "$ALIAS_PATH" || return 1
+    ALIAS_CREATED=1
   fi
-fi
-
-install -d -m 0755 "$(dirname "$INSTALL_PATH")" || {
-  error "无法创建管理器安装目录。"
-  exit 1
+  [[ "$("$INSTALL_PATH" version 2>/dev/null)" == "vps-manager ${manager_version}" &&
+     "$("$HELPER_PATH" version 2>/dev/null)" == "vps-manager-network-rollback ${helper_version}" ]] || {
+    error "安装后自检失败，将恢复原版本。"; return 1;
+  }
+  COMMITTED=1
+  info "vps-manager ${manager_version} 已安装；原有系统配置不会自动修改。"
+  installer_cleanup
+  WORK_DIR=""
+  trap - EXIT HUP INT TERM
+  (( LOCK_INHERITED )) || flock -u 9
+  exec 9>&-
+  if (( $# > 0 )); then "$INSTALL_PATH" "$@"; return $?; fi
+  if [[ -t 0 && -t 1 ]]; then exec "$INSTALL_PATH"; fi
+  info "稍后运行 sudo lm 打开菜单。"
 }
-[[ ! -L "$INSTALL_PATH" ]] || { error "安装目标不能是软链接：${INSTALL_PATH}"; exit 1; }
-[[ ! -e "$INSTALL_PATH" || -f "$INSTALL_PATH" ]] || { error "安装目标必须是普通文件路径：${INSTALL_PATH}"; exit 1; }
-if [[ -n "$ALIAS_PATH" ]]; then
-  install -d -m 0755 "$(dirname "$ALIAS_PATH")" || exit 1
-  if [[ ( -e "$ALIAS_PATH" || -L "$ALIAS_PATH" ) && "$(readlink -f "$ALIAS_PATH" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
-    error "快捷命令路径已被其他程序占用，不会覆盖：${ALIAS_PATH}"
-    exit 1
-  fi
-fi
-if [[ -f "$INSTALL_PATH" ]]; then
-  BACKUP_FILE="$(mktemp /tmp/vps-manager-existing.XXXXXX.sh)" || exit 1
-  cp -a -- "$INSTALL_PATH" "$BACKUP_FILE" || exit 1
-fi
-INSTALL_CHANGED=1
-if ! install -m 0755 "$TEMP_FILE" "$INSTALL_PATH"; then
-  restore_manager
-  INSTALL_CHANGED=0
-  error "管理器安装失败，已尝试恢复原版本。"
-  exit 1
-fi
-if [[ -n "$ALIAS_PATH" && ! -e "$ALIAS_PATH" && ! -L "$ALIAS_PATH" ]]; then
-  if ! ln -s "$INSTALL_PATH" "$ALIAS_PATH"; then
-    restore_manager
-    INSTALL_CHANGED=0
-    error "无法创建快捷命令 ${ALIAS_PATH}。"
-    exit 1
-  fi
-  ALIAS_CREATED=1
-  ok "快捷命令已配置：sudo $(basename "$ALIAS_PATH")"
-fi
-if [[ "$("$INSTALL_PATH" version 2>/dev/null)" != "vps-manager ${MANAGER_VERSION}" ]]; then
-  restore_manager
-  INSTALL_CHANGED=0
-  error "安装后的版本自检失败，已恢复原版本。"
-  exit 1
-fi
-COMMITTED=1
 
-hash_value="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || true)"
-ok "vps-manager ${MANAGER_VERSION} 已安装到 ${INSTALL_PATH}"
-[[ -n "$hash_value" ]] && printf 'SHA-256: %s\n' "$hash_value"
-
-cleanup
-TEMP_FILE=""
-BACKUP_FILE=""
-trap - EXIT HUP INT TERM
-
-if (( $# > 0 )); then
-  exec "$INSTALL_PATH" "$@"
-fi
-
-if [[ -r /dev/tty && -w /dev/tty ]]; then
-  exec "$INSTALL_PATH" </dev/tty >/dev/tty
-fi
-
-info "当前环境没有交互终端。稍后运行：sudo ${INSTALL_PATH} 或 sudo ${ALIAS_PATH}"
+if [[ "${VPS_MANAGER_INSTALLER_NO_MAIN:-0}" != 1 ]]; then installer_main "$@"; fi
